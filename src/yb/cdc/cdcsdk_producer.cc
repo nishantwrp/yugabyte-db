@@ -1327,10 +1327,10 @@ uint64_t GetTransactionCommitTime(const std::shared_ptr<yb::consensus::LWReplica
 }
 
 void SortConsistentWALRecords(
-    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& consistent_wal_records,
+    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* consistent_wal_records,
     const int& non_transaction_ops) {
   std::sort(
-      consistent_wal_records.begin() + non_transaction_ops, consistent_wal_records.end(),
+      (*consistent_wal_records).begin() + non_transaction_ops, (*consistent_wal_records).end(),
       [](std::shared_ptr<yb::consensus::LWReplicateMsg> lhs,
          std::shared_ptr<yb::consensus::LWReplicateMsg>
              rhs) -> bool {
@@ -1340,8 +1340,8 @@ void SortConsistentWALRecords(
 
 Status GetConsistentWALRecords(
     const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
-    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& consistent_wal_records,
-    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints,
+    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* consistent_wal_records,
+    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* all_checkpoints,
     const uint64_t& consistent_safe_time, OpId* last_seen_op_id, int64_t** last_readable_opid_index,
     const int64_t& safe_hybrid_time, const CoarseTimePoint& deadline, bool get_one_record) {
   int non_transaction_ops = 0;
@@ -1366,7 +1366,7 @@ Status GetConsistentWALRecords(
           last_seen_op_id->index = msg->id().index();
 
           non_transaction_ops++;
-          consistent_wal_records.push_back(msg);
+          consistent_wal_records->push_back(msg);
           if (get_one_record) {
             stop_fetching_messages = true;
             break;
@@ -1394,8 +1394,8 @@ Status GetConsistentWALRecords(
       last_seen_op_id->index = msg->id().index();
       if ((int64_t)GetTransactionCommitTime(msg) > safe_hybrid_time) {
         found_transaction_op = true;
-        consistent_wal_records.push_back(msg);
-        all_checkpoints.push_back(msg);
+        consistent_wal_records->push_back(msg);
+        all_checkpoints->push_back(msg);
         if (get_one_record) {
           stop_fetching_messages = true;
           break;
@@ -1590,7 +1590,7 @@ Status GetChangesForCDCSDK(
     std::unordered_set<std::shared_ptr<yb::consensus::LWReplicateMsg>> processed_messages;
 
     RETURN_NOT_OK(GetConsistentWALRecords(
-        tablet_peer, consistent_wal_records, all_checkpoints, consistent_safe_time,
+        tablet_peer, &consistent_wal_records, &all_checkpoints, consistent_safe_time,
         &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline, true));
     have_more_messages = HaveMoreMessages(true);
 
@@ -1652,7 +1652,7 @@ Status GetChangesForCDCSDK(
       std::unordered_set<std::shared_ptr<yb::consensus::LWReplicateMsg>> processed_messages;
 
       RETURN_NOT_OK(GetConsistentWALRecords(
-          tablet_peer, consistent_wal_records, all_checkpoints, consistent_safe_time,
+          tablet_peer, &consistent_wal_records, &all_checkpoints, consistent_safe_time,
           &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline, false));
 
       if (consistent_wal_records.empty()) {
