@@ -1707,7 +1707,7 @@ void CDCServiceImpl::GetChanges(
     status = GetChangesForCDCSDK(
         req->stream_id(), req->tablet_id(), cdc_sdk_from_op_id, record, tablet_peer, mem_tracker,
         *enum_map_result, *composite_atts_map, client(), &msgs_holder, resp, &commit_timestamp,
-        &cached_schema_details, &last_streamed_op_id, &last_readable_index,
+        &cached_schema_details, &last_streamed_op_id, req->safe_hybrid_time(), &last_readable_index,
         tablet_peer->tablet_metadata()->colocated() ? req->table_id() : "", get_changes_deadline);
     // This specific error from the docdb_pgapi layer is used to identify enum cache entry is
     // out of date, hence we need to repopulate.
@@ -1735,8 +1735,9 @@ void CDCServiceImpl::GetChanges(
       status = GetChangesForCDCSDK(
           req->stream_id(), req->tablet_id(), cdc_sdk_from_op_id, record, tablet_peer, mem_tracker,
           *enum_map_result, *composite_atts_map, client(), &msgs_holder, resp, &commit_timestamp,
-          &cached_schema_details, &last_streamed_op_id, &last_readable_index,
-          tablet_peer->tablet_metadata()->colocated() ? req->table_id() : "", get_changes_deadline);
+          &cached_schema_details, &last_streamed_op_id, req->safe_hybrid_time(),
+          &last_readable_index, tablet_peer->tablet_metadata()->colocated() ? req->table_id() : "",
+          get_changes_deadline);
     }
     // This specific error indicates that a tablet split occured on the tablet.
     if (status.IsTabletSplit()) {
@@ -1792,6 +1793,7 @@ void CDCServiceImpl::GetChanges(
     bool is_colocated = tablet_peer->tablet_metadata()->colocated();
     OpId snapshot_op_id = OpId::Invalid();
     std::string snapshot_key = "";
+
     // If snapshot operation or before image is enabled, don't allow compaction.
     HybridTime cdc_sdk_safe_time = HybridTime::kInvalid;
     if (record.record_type == CDCRecordType::ALL || cdc_sdk_from_op_id.write_id() == -1) {

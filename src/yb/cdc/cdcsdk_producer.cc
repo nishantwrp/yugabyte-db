@@ -1307,6 +1307,124 @@ bool VerifyTabletSplitOnParentTablet(
   return (children_tablet_count == 2);
 }
 
+bool IsWriteOp(const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg) {
+  return msg->op_type() == consensus::OperationType::WRITE_OP;
+}
+
+bool IsIntent(const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg) {
+  return IsWriteOp(msg) && msg->write().write_batch().has_transaction();
+}
+
+bool IsUpdateTransactionOp(const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg) {
+  return msg->op_type() == consensus::OperationType::UPDATE_TRANSACTION_OP;
+}
+
+uint64_t GetTransactionCommitTime(const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg) {
+  // if ((!IsWriteOp(msg) && !IsUpdateTransactionOp(msg)) || IsIntent(msg)) {
+  // }
+  return IsUpdateTransactionOp(msg) ? msg->transaction_state().commit_hybrid_time()
+                                    : msg->hybrid_time();
+}
+
+void SortConsistentWALRecords(
+    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& consistent_wal_records,
+    const int& non_transaction_ops) {
+  std::sort(
+      consistent_wal_records.begin() + non_transaction_ops, consistent_wal_records.end(),
+      [](std::shared_ptr<yb::consensus::LWReplicateMsg> lhs,
+         std::shared_ptr<yb::consensus::LWReplicateMsg>
+             rhs) -> bool {
+        return GetTransactionCommitTime(lhs) <= GetTransactionCommitTime(rhs);
+      });
+}
+
+Status GetConsistentWALRecords(
+    const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& consistent_wal_records,
+    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints,
+    const uint64_t& consistent_safe_time, OpId* last_seen_op_id, int64_t** last_readable_opid_index,
+    const int64_t& safe_hybrid_time, const CoarseTimePoint& deadline, bool get_one_record) {
+  int non_transaction_ops = 0;
+  bool found_transaction_op = false;
+  bool stop_fetching_messages = false;
+  do {
+    consensus::ReadOpsResult read_ops;
+    read_ops = VERIFY_RESULT(tablet_peer->consensus()->ReadReplicatedMessagesForCDC(
+        *last_seen_op_id, *last_readable_opid_index, deadline));
+
+    if (read_ops.messages.empty()) {
+      VLOG_WITH_FUNC(1) << "Did not get any messages with current batch of 'read_ops'."
+                        << "last_seen_op_id: " << last_seen_op_id << ", last_readable_opid_index "
+                        << *last_readable_opid_index;
+      break;
+    }
+
+    for (const auto& msg : read_ops.messages) {
+      if (!IsWriteOp(msg) && !IsUpdateTransactionOp(msg)) {
+        if (!found_transaction_op) {
+          last_seen_op_id->term = msg->id().term();
+          last_seen_op_id->index = msg->id().index();
+
+          non_transaction_ops++;
+          consistent_wal_records.push_back(msg);
+          if (get_one_record) {
+            stop_fetching_messages = true;
+            break;
+          }
+
+          continue;
+        }
+
+        stop_fetching_messages = true;
+        break;
+      }
+
+      if (IsIntent(msg)) {
+        last_seen_op_id->term = msg->id().term();
+        last_seen_op_id->index = msg->id().index();
+        continue;
+      }
+
+      if (GetTransactionCommitTime(msg) > consistent_safe_time) {
+        stop_fetching_messages = true;
+        break;
+      }
+
+      last_seen_op_id->term = msg->id().term();
+      last_seen_op_id->index = msg->id().index();
+      if ((int64_t)GetTransactionCommitTime(msg) > safe_hybrid_time) {
+        found_transaction_op = true;
+        consistent_wal_records.push_back(msg);
+        all_checkpoints.push_back(msg);
+        if (get_one_record) {
+          stop_fetching_messages = true;
+          break;
+        }
+      }
+    }
+  } while ((!stop_fetching_messages) &&
+           ((*last_readable_opid_index) && last_seen_op_id->index < **last_readable_opid_index));
+
+  SortConsistentWALRecords(consistent_wal_records, non_transaction_ops);
+  return Status::OK();
+}
+
+bool CanUpdateCheckpoint(
+    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, int* curr_checkpoint_index,
+    std::unordered_set<std::shared_ptr<yb::consensus::LWReplicateMsg>>* processed_messages,
+    const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints) {
+  if (all_checkpoints[*curr_checkpoint_index] == msg) {
+    (*curr_checkpoint_index)++;
+    processed_messages->insert(msg);
+    while (ContainsKey(*processed_messages, all_checkpoints[*curr_checkpoint_index])) {
+      (*curr_checkpoint_index)++;
+    }
+    return true;
+  }
+
+  return false;
+}
+
 // CDC get changes is different from xCluster as it doesn't need
 // to read intents from WAL.
 
@@ -1325,6 +1443,7 @@ Status GetChangesForCDCSDK(
     uint64_t* commit_timestamp,
     SchemaDetailsMap* cached_schema_details,
     OpId* last_streamed_op_id,
+    const int64_t& safe_hybrid_time,
     int64_t* last_readable_opid_index,
     const TableId& colocated_table_id,
     const CoarseTimePoint deadline) {
@@ -1336,6 +1455,8 @@ Status GetChangesForCDCSDK(
   bool report_tablet_split = false;
   OpId split_op_id = OpId::Invalid();
   bool snapshot_operation = false;
+  // TODO(nishantwrp): Implement this function
+  uint64_t consistent_safe_time = 0;
 
   auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet_safe());
   auto leader_safe_time = tablet_ptr->SafeTime();
@@ -1461,22 +1582,27 @@ Status GetChangesForCDCSDK(
     OpId last_seen_op_id;
     last_seen_op_id.term = from_op_id.term();
     last_seen_op_id.index = from_op_id.index();
-    consensus::ReadOpsResult read_ops;
     uint64_t commit_timestamp = 0;
 
-    read_ops = VERIFY_RESULT(tablet_peer->consensus()->ReadReplicatedMessagesForCDC(
-        last_seen_op_id, last_readable_opid_index, deadline, true));
+    int curr_checkpoint = 0;
+    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>> consistent_wal_records,
+        all_checkpoints;
+    std::unordered_set<std::shared_ptr<yb::consensus::LWReplicateMsg>> processed_messages;
+
+    RETURN_NOT_OK(GetConsistentWALRecords(
+        tablet_peer, consistent_wal_records, all_checkpoints, consistent_safe_time,
+        &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline, true));
     have_more_messages = HaveMoreMessages(true);
 
-    if (read_ops.messages.size() != 1) {
+    if (consistent_wal_records.size() != 1) {
       LOG(WARNING) << "Reading more or less than one raft log message while reading intents, read "
-                   << read_ops.messages.size() << " instead";
+                   << consistent_wal_records.size() << " instead";
     }
 
-    if (read_ops.messages.size() > 0 &&
-        read_ops.messages[0]->op_type() == consensus::OperationType::UPDATE_TRANSACTION_OP &&
-        read_ops.messages[0]->transaction_state().has_commit_hybrid_time()) {
-      commit_timestamp = read_ops.messages[0]->transaction_state().commit_hybrid_time();
+    if (consistent_wal_records.size() > 0 &&
+        consistent_wal_records[0]->op_type() == consensus::OperationType::UPDATE_TRANSACTION_OP &&
+        consistent_wal_records[0]->transaction_state().has_commit_hybrid_time()) {
+      commit_timestamp = consistent_wal_records[0]->transaction_state().commit_hybrid_time();
     } else {
       LOG(WARNING) << "Unable to read the transaction commit time for tablet_id: " << tablet_id
                    << " with stream_id: " << stream_id
@@ -1502,8 +1628,11 @@ Status GetChangesForCDCSDK(
                                      .record_time());
 
     if (checkpoint.write_id() == 0 && checkpoint.key().empty()) {
-      last_streamed_op_id->term = checkpoint.term();
-      last_streamed_op_id->index = checkpoint.index();
+      if (CanUpdateCheckpoint(
+              consistent_wal_records[0], &curr_checkpoint, &processed_messages, all_checkpoints)) {
+        last_streamed_op_id->term = checkpoint.term();
+        last_streamed_op_id->index = checkpoint.index();
+      }
     }
     checkpoint_updated = true;
   } else {
@@ -1516,14 +1645,29 @@ Status GetChangesForCDCSDK(
     // 'ReadReplicatedMessagesForCDC' , will not have any actionable messages. In which case we
     // keep retrying by fetching the next batch, until either we get an actionable message or reach
     // the 'last_readable_opid_index'.
-    consensus::ReadOpsResult read_ops;
     do {
-      read_ops = VERIFY_RESULT(tablet_peer->consensus()->ReadReplicatedMessagesForCDC(
-          last_seen_op_id, last_readable_opid_index, deadline));
+      int curr_checkpoint_index = 0;
+      std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>> consistent_wal_records,
+          all_checkpoints;
+      std::unordered_set<std::shared_ptr<yb::consensus::LWReplicateMsg>> processed_messages;
 
-      if (read_ops.read_from_disk_size && mem_tracker) {
-        consumption = ScopedTrackedConsumption(mem_tracker, read_ops.read_from_disk_size);
+      RETURN_NOT_OK(GetConsistentWALRecords(
+          tablet_peer, consistent_wal_records, all_checkpoints, consistent_safe_time,
+          &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline, false));
+
+      if (consistent_wal_records.empty()) {
+        VLOG_WITH_FUNC(1)
+            << "Did not get any messages with current batch of 'consistent_wal_records'."
+            << "last_seen_op_id: " << last_seen_op_id << ", last_readable_opid_index "
+            << *last_readable_opid_index << ", safe_hybrid_time " << safe_hybrid_time
+            << ", consistent_safe_time " << consistent_safe_time;
+        break;
       }
+
+      // TODO(nishantwrp): Fix this
+      // if (read_ops.read_from_disk_size && mem_tracker) {
+      //   consumption = ScopedTrackedConsumption(mem_tracker, read_ops.read_from_disk_size);
+      // }
 
       auto txn_participant = tablet_ptr->transaction_participant();
       if (txn_participant) {
@@ -1534,17 +1678,7 @@ Status GetChangesForCDCSDK(
       Schema current_schema = *tablet_ptr->metadata()->schema();
       bool pending_intents = false;
 
-      if (read_ops.messages.empty()) {
-        VLOG_WITH_FUNC(1) << "Did not get any messages with current batch of 'read_ops'."
-                          << "last_seen_op_id: " << last_seen_op_id << ", last_readable_opid_index "
-                          << *last_readable_opid_index;
-        break;
-      }
-
-      for (const auto& msg : read_ops.messages) {
-        last_seen_op_id.term = msg->id().term();
-        last_seen_op_id.index = msg->id().index();
-
+      for (const auto& msg : consistent_wal_records) {
         switch (msg->op_type()) {
           case consensus::OperationType::UPDATE_TRANSACTION_OP:
             // Ignore intents.
@@ -1569,8 +1703,11 @@ Status GetChangesForCDCSDK(
                 VLOG(1) << "There are pending intents for the transaction id " << txn_id
                         << " with apply record OpId: " << op_id;
               } else {
-                last_streamed_op_id->term = msg->id().term();
-                last_streamed_op_id->index = msg->id().index();
+                if (CanUpdateCheckpoint(
+                        msg, &curr_checkpoint_index, &processed_messages, all_checkpoints)) {
+                  last_streamed_op_id->term = all_checkpoints[curr_checkpoint_index]->id().term();
+                  last_streamed_op_id->index = all_checkpoints[curr_checkpoint_index]->id().index();
+                }
               }
             }
             checkpoint_updated = true;
@@ -1585,8 +1722,13 @@ Status GetChangesForCDCSDK(
                   msg, stream_metadata, tablet_peer, enum_oid_label_map, composite_atts_map,
                   cached_schema_details, resp, client));
 
-              SetCheckpoint(
-                  msg->id().term(), msg->id().index(), 0, "", 0, &checkpoint, last_streamed_op_id);
+              if (CanUpdateCheckpoint(
+                      msg, &curr_checkpoint_index, &processed_messages, all_checkpoints)) {
+                SetCheckpoint(
+                    all_checkpoints[curr_checkpoint_index]->id().term(),
+                    all_checkpoints[curr_checkpoint_index]->id().index(), 0, "", 0, &checkpoint,
+                    last_streamed_op_id);
+              }
               checkpoint_updated = true;
             }
           } break;
@@ -1713,10 +1855,12 @@ Status GetChangesForCDCSDK(
           ht_of_last_returned_message = HybridTime(msg->hybrid_time());
         }
       }
-      if (read_ops.messages.size() > 0) {
-        *msgs_holder = consensus::ReplicateMsgsHolder(
-            nullptr, std::move(read_ops.messages), std::move(consumption));
-      }
+
+      // TODO(nishantwrp): Fix this
+      // if (read_ops.messages.size() > 0) {
+      //   *msgs_holder = consensus::ReplicateMsgsHolder(
+      //       nullptr, std::move(read_ops.messages), std::move(consumption));
+      // }
 
       if (!checkpoint_updated && VLOG_IS_ON(1)) {
         VLOG_WITH_FUNC(1)

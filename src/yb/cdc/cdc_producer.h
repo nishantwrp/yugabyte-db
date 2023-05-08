@@ -108,6 +108,7 @@ Status GetChangesForCDCSDK(
     uint64_t* commit_timestamp,
     SchemaDetailsMap* cached_schema_details,
     OpId* last_streamed_op_id,
+    const int64_t& safe_hybrid_time,
     int64_t* last_readable_opid_index = nullptr,
     const TableId& colocated_table_id = "",
     const CoarseTimePoint deadline = CoarseTimePoint::max());
