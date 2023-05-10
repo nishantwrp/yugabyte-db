@@ -1217,8 +1217,6 @@ Status ProcessIntents(
         commit_time, client));
   }
 
-  SetTermIndex(op_id.term, op_id.index, checkpoint);
-
   if (stream_state->key.empty() && stream_state->write_id == 0) {
     FillCommitRecord(op_id, transaction_id, tablet_peer, checkpoint, resp, commit_time);
   } else {
@@ -1379,7 +1377,8 @@ Status GetConsistentWALRecords(
         break;
       }
 
-      if (IsIntent(msg)) {
+      if (IsIntent(msg) || (IsUpdateTransactionOp(msg) &&
+                            msg->transaction_state().status() != TransactionStatus::APPLYING)) {
         last_seen_op_id->term = msg->id().term();
         last_seen_op_id->index = msg->id().index();
         continue;
@@ -1409,7 +1408,7 @@ Status GetConsistentWALRecords(
   return Status::OK();
 }
 
-bool CanUpdateCheckpoint(
+bool CanUpdateCheckpointOpId(
     const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, int* curr_checkpoint_index,
     std::unordered_set<std::shared_ptr<yb::consensus::LWReplicateMsg>>* processed_messages,
     const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints) {
@@ -1617,22 +1616,15 @@ Status GetChangesForCDCSDK(
         op_id, transaction_id, stream_metadata, enum_oid_label_map, composite_atts_map, resp,
         &consumption, &checkpoint, tablet_peer, &keyValueIntents, &stream_state, client,
         cached_schema_details, commit_timestamp));
-    ht_of_last_returned_message =
-        (resp->cdc_sdk_proto_records(resp->cdc_sdk_proto_records_size() - 1).row_message().op() ==
-         RowMessage_Op_COMMIT)
-            // Commit time won't be populated in the COMMIT record, in which case we will consider
-            // the commit_time of the previous to last record.
-            ? HybridTime(commit_timestamp)
-            : HybridTime::FromPB(resp->cdc_sdk_proto_records(resp->cdc_sdk_proto_records_size() - 1)
-                                     .row_message()
-                                     .record_time());
 
     if (checkpoint.write_id() == 0 && checkpoint.key().empty()) {
-      if (CanUpdateCheckpoint(
+      if (CanUpdateCheckpointOpId(
               consistent_wal_records[0], &curr_checkpoint, &processed_messages, all_checkpoints)) {
+        SetTermIndex(op_id.term, op_id.index, &checkpoint);
         last_streamed_op_id->term = checkpoint.term();
         last_streamed_op_id->index = checkpoint.index();
       }
+      ht_of_last_returned_message = HybridTime(commit_timestamp);
     }
     checkpoint_updated = true;
   } else {
@@ -1703,11 +1695,13 @@ Status GetChangesForCDCSDK(
                 VLOG(1) << "There are pending intents for the transaction id " << txn_id
                         << " with apply record OpId: " << op_id;
               } else {
-                if (CanUpdateCheckpoint(
+                if (CanUpdateCheckpointOpId(
                         msg, &curr_checkpoint_index, &processed_messages, all_checkpoints)) {
+                  SetTermIndex(op_id.term, op_id.index, &checkpoint);
                   last_streamed_op_id->term = all_checkpoints[curr_checkpoint_index]->id().term();
                   last_streamed_op_id->index = all_checkpoints[curr_checkpoint_index]->id().index();
                 }
+                ht_of_last_returned_message = HybridTime(GetTransactionCommitTime(msg));
               }
             }
             checkpoint_updated = true;
@@ -1722,13 +1716,14 @@ Status GetChangesForCDCSDK(
                   msg, stream_metadata, tablet_peer, enum_oid_label_map, composite_atts_map,
                   cached_schema_details, resp, client));
 
-              if (CanUpdateCheckpoint(
+              if (CanUpdateCheckpointOpId(
                       msg, &curr_checkpoint_index, &processed_messages, all_checkpoints)) {
                 SetCheckpoint(
                     all_checkpoints[curr_checkpoint_index]->id().term(),
                     all_checkpoints[curr_checkpoint_index]->id().index(), 0, "", 0, &checkpoint,
                     last_streamed_op_id);
               }
+              ht_of_last_returned_message = HybridTime(GetTransactionCommitTime(msg));
               checkpoint_updated = true;
             }
           } break;
@@ -1782,6 +1777,7 @@ Status GetChangesForCDCSDK(
 
             SetCheckpoint(
                 msg->id().term(), msg->id().index(), 0, "", 0, &checkpoint, last_streamed_op_id);
+            ht_of_last_returned_message = HybridTime(msg->hybrid_time());
             checkpoint_updated = true;
           } break;
 
@@ -1791,6 +1787,7 @@ Status GetChangesForCDCSDK(
                   msg, resp->add_cdc_sdk_proto_records(), current_schema));
               SetCheckpoint(
                   msg->id().term(), msg->id().index(), 0, "", 0, &checkpoint, last_streamed_op_id);
+              ht_of_last_returned_message = HybridTime(msg->hybrid_time());
               checkpoint_updated = true;
             }
           } break;
@@ -1829,6 +1826,7 @@ Status GetChangesForCDCSDK(
                           << ", and if we did not see any other records we will report the tablet "
                              "split to the client";
                 SetCheckpoint(op_id.term, op_id.index, 0, "", 0, &checkpoint, last_streamed_op_id);
+                ht_of_last_returned_message = HybridTime(msg->hybrid_time());
                 checkpoint_updated = true;
                 split_op_id = op_id;
               }
@@ -1838,6 +1836,7 @@ Status GetChangesForCDCSDK(
           default:
             // Nothing to do for other operation types.
             last_seen_default_message_op_id = OpId(msg->id().term(), msg->id().index());
+            ht_of_last_returned_message = HybridTime(msg->hybrid_time());
             VLOG_WITH_FUNC(2) << "Found message of Op type: " << msg->op_type()
                               << ", on tablet: " << tablet_id
                               << ", with OpId: " << msg->id().ShortDebugString();
@@ -1845,14 +1844,7 @@ Status GetChangesForCDCSDK(
         }
 
         if (pending_intents) {
-          // Incase of pending intents use the last replicated intents commit time.
-          ht_of_last_returned_message =
-              HybridTime::FromPB(resp->cdc_sdk_proto_records(resp->cdc_sdk_proto_records_size() - 1)
-                                     .row_message()
-                                     .record_time());
           break;
-        } else {
-          ht_of_last_returned_message = HybridTime(msg->hybrid_time());
         }
       }
 
