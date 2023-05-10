@@ -472,7 +472,9 @@ class TransactionParticipant::Impl
 
   HybridTime GetMinStartTimeAmongAllRunningTransactions() {
     std::lock_guard<std::mutex> lock(mutex_);
-    return transactions_.get<StartTimeTag>().begin()->get()->start_ht();
+    return transactions_.get<StartTimeTag>().size()
+               ? transactions_.get<StartTimeTag>().begin()->get()->start_ht()
+               : HybridTime::kInvalid;
   }
 
   OpId GetRetainOpId() {

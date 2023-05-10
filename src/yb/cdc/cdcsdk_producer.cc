@@ -1358,6 +1358,7 @@ Status GetConsistentWALRecords(
     }
 
     for (const auto& msg : read_ops.messages) {
+      LOG(WARNING) << "msg: " << msg->op_type() << " " << msg->hybrid_time();
       if (!IsWriteOp(msg) && !IsUpdateTransactionOp(msg)) {
         if (!found_transaction_op) {
           last_seen_op_id->term = msg->id().term();
@@ -1391,10 +1392,10 @@ Status GetConsistentWALRecords(
 
       last_seen_op_id->term = msg->id().term();
       last_seen_op_id->index = msg->id().index();
+      all_checkpoints->push_back(msg);
       if ((int64_t)GetTransactionCommitTime(msg) > safe_hybrid_time) {
         found_transaction_op = true;
         consistent_wal_records->push_back(msg);
-        all_checkpoints->push_back(msg);
         if (get_one_record) {
           stop_fetching_messages = true;
           break;
@@ -1409,19 +1410,28 @@ Status GetConsistentWALRecords(
 }
 
 bool CanUpdateCheckpointOpId(
-    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, int* curr_checkpoint_index,
+    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, size_t* next_checkpoint_index,
     std::unordered_set<std::shared_ptr<yb::consensus::LWReplicateMsg>>* processed_messages,
-    const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints) {
-  if (all_checkpoints[*curr_checkpoint_index] == msg) {
-    (*curr_checkpoint_index)++;
-    processed_messages->insert(msg);
-    while (ContainsKey(*processed_messages, all_checkpoints[*curr_checkpoint_index])) {
-      (*curr_checkpoint_index)++;
-    }
-    return true;
+    const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints,
+    const uint64_t& commit_time) {
+  bool update_checkpoint = false;
+  processed_messages->insert(msg);
+  while ((*next_checkpoint_index) < all_checkpoints.size() &&
+         (GetTransactionCommitTime(msg) <= commit_time ||
+          ContainsKey(*processed_messages, all_checkpoints[*next_checkpoint_index]))) {
+    (*next_checkpoint_index)++;
+    update_checkpoint = true;
   }
+  return update_checkpoint;
+}
 
-  return false;
+uint64_t GetConsistentStreamSafeTime(
+    const std::shared_ptr<tablet::TabletPeer>& tablet_peer, const tablet::TabletPtr& tablet_ptr) {
+  HybridTime consistent_stream_safe_time =
+      tablet_ptr->transaction_participant()->GetMinStartTimeAmongAllRunningTransactions();
+  return consistent_stream_safe_time == HybridTime::kInvalid
+             ? tablet_peer->SafeTimeForTransactionParticipant().ToUint64()
+             : consistent_stream_safe_time.ToUint64();
 }
 
 // CDC get changes is different from xCluster as it doesn't need
@@ -1456,9 +1466,7 @@ Status GetChangesForCDCSDK(
   bool snapshot_operation = false;
 
   auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet_safe());
-  uint64_t consistent_safe_time = tablet_ptr->transaction_participant()
-                                      ->GetMinStartTimeAmongAllRunningTransactions()
-                                      .ToUint64();
+  uint64_t consistent_stream_safe_time = GetConsistentStreamSafeTime(tablet_peer, tablet_ptr);
   auto leader_safe_time = tablet_ptr->SafeTime();
   if (!leader_safe_time.ok()) {
     YB_LOG_EVERY_N_SECS(WARNING, 10)
@@ -1584,13 +1592,13 @@ Status GetChangesForCDCSDK(
     last_seen_op_id.index = from_op_id.index();
     uint64_t commit_timestamp = 0;
 
-    int curr_checkpoint = 0;
+    size_t next_checkpoint_index = 0;
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>> consistent_wal_records,
         all_checkpoints;
     std::unordered_set<std::shared_ptr<yb::consensus::LWReplicateMsg>> processed_messages;
 
     RETURN_NOT_OK(GetConsistentWALRecords(
-        tablet_peer, &consistent_wal_records, &all_checkpoints, consistent_safe_time,
+        tablet_peer, &consistent_wal_records, &all_checkpoints, consistent_stream_safe_time,
         &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline, true));
     have_more_messages = HaveMoreMessages(true);
 
@@ -1619,13 +1627,16 @@ Status GetChangesForCDCSDK(
         cached_schema_details, commit_timestamp));
 
     if (checkpoint.write_id() == 0 && checkpoint.key().empty()) {
-      if (CanUpdateCheckpointOpId(
-              consistent_wal_records[0], &curr_checkpoint, &processed_messages, all_checkpoints)) {
-        SetTermIndex(op_id.term, op_id.index, &checkpoint);
-        last_streamed_op_id->term = checkpoint.term();
-        last_streamed_op_id->index = checkpoint.index();
-      }
       ht_of_last_returned_message = HybridTime(commit_timestamp);
+      if (CanUpdateCheckpointOpId(
+              consistent_wal_records[0], &next_checkpoint_index, &processed_messages,
+              all_checkpoints, ht_of_last_returned_message.ToUint64())) {
+        int64_t term = all_checkpoints[next_checkpoint_index - 1]->id().term();
+        int64_t index = all_checkpoints[next_checkpoint_index - 1]->id().index();
+        SetTermIndex(term, index, &checkpoint);
+        last_streamed_op_id->term = term;
+        last_streamed_op_id->index = index;
+      }
     }
     checkpoint_updated = true;
   } else {
@@ -1639,13 +1650,13 @@ Status GetChangesForCDCSDK(
     // keep retrying by fetching the next batch, until either we get an actionable message or reach
     // the 'last_readable_opid_index'.
     do {
-      int curr_checkpoint_index = 0;
+      size_t next_checkpoint_index = 0;
       std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>> consistent_wal_records,
           all_checkpoints;
       std::unordered_set<std::shared_ptr<yb::consensus::LWReplicateMsg>> processed_messages;
 
       RETURN_NOT_OK(GetConsistentWALRecords(
-          tablet_peer, &consistent_wal_records, &all_checkpoints, consistent_safe_time,
+          tablet_peer, &consistent_wal_records, &all_checkpoints, consistent_stream_safe_time,
           &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline, false));
 
       if (consistent_wal_records.empty()) {
@@ -1653,7 +1664,7 @@ Status GetChangesForCDCSDK(
             << "Did not get any messages with current batch of 'consistent_wal_records'."
             << "last_seen_op_id: " << last_seen_op_id << ", last_readable_opid_index "
             << *last_readable_opid_index << ", safe_hybrid_time " << safe_hybrid_time
-            << ", consistent_safe_time " << consistent_safe_time;
+            << ", consistent_safe_time " << consistent_stream_safe_time;
         break;
       }
 
@@ -1696,13 +1707,16 @@ Status GetChangesForCDCSDK(
                 VLOG(1) << "There are pending intents for the transaction id " << txn_id
                         << " with apply record OpId: " << op_id;
               } else {
-                if (CanUpdateCheckpointOpId(
-                        msg, &curr_checkpoint_index, &processed_messages, all_checkpoints)) {
-                  SetTermIndex(op_id.term, op_id.index, &checkpoint);
-                  last_streamed_op_id->term = all_checkpoints[curr_checkpoint_index]->id().term();
-                  last_streamed_op_id->index = all_checkpoints[curr_checkpoint_index]->id().index();
-                }
                 ht_of_last_returned_message = HybridTime(GetTransactionCommitTime(msg));
+                if (CanUpdateCheckpointOpId(
+                        msg, &next_checkpoint_index, &processed_messages, all_checkpoints,
+                        ht_of_last_returned_message.ToUint64())) {
+                  int64_t term = all_checkpoints[next_checkpoint_index - 1]->id().term();
+                  int64_t index = all_checkpoints[next_checkpoint_index - 1]->id().index();
+                  SetTermIndex(term, index, &checkpoint);
+                  last_streamed_op_id->term = term;
+                  last_streamed_op_id->index = index;
+                }
               }
             }
             checkpoint_updated = true;
@@ -1717,14 +1731,15 @@ Status GetChangesForCDCSDK(
                   msg, stream_metadata, tablet_peer, enum_oid_label_map, composite_atts_map,
                   cached_schema_details, resp, client));
 
+              ht_of_last_returned_message = HybridTime(GetTransactionCommitTime(msg));
               if (CanUpdateCheckpointOpId(
-                      msg, &curr_checkpoint_index, &processed_messages, all_checkpoints)) {
+                      msg, &next_checkpoint_index, &processed_messages, all_checkpoints,
+                      ht_of_last_returned_message.ToUint64())) {
                 SetCheckpoint(
-                    all_checkpoints[curr_checkpoint_index]->id().term(),
-                    all_checkpoints[curr_checkpoint_index]->id().index(), 0, "", 0, &checkpoint,
+                    all_checkpoints[next_checkpoint_index - 1]->id().term(),
+                    all_checkpoints[next_checkpoint_index - 1]->id().index(), 0, "", 0, &checkpoint,
                     last_streamed_op_id);
               }
-              ht_of_last_returned_message = HybridTime(GetTransactionCommitTime(msg));
               checkpoint_updated = true;
             }
           } break;
