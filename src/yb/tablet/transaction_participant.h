@@ -234,6 +234,8 @@ class TransactionParticipant : public TransactionStatusManager {
 
   OpId GetLatestCheckPoint() const;
 
+  HybridTime GetMinStartTimeAmongAllRunningTransactions() const;
+
   const TabletId& tablet_id() const override;
 
   size_t TEST_GetNumRunningTransactions() const;

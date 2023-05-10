@@ -470,6 +470,11 @@ class TransactionParticipant::Impl
     return min_checkpoint;
   }
 
+  HybridTime GetMinStartTimeAmongAllRunningTransactions() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return transactions_.get<StartTimeTag>().begin()->get()->start_ht();
+  }
+
   OpId GetRetainOpId() {
     std::lock_guard<std::mutex> lock(mutex_);
     return cdc_sdk_min_checkpoint_op_id_;
@@ -2098,6 +2103,10 @@ CoarseTimePoint TransactionParticipant::GetCheckpointExpirationTime() const {
 
 OpId TransactionParticipant::GetLatestCheckPoint() const {
   return impl_->GetLatestCheckPointUnlocked();
+}
+
+HybridTime TransactionParticipant::GetMinStartTimeAmongAllRunningTransactions() const {
+  return impl_->GetMinStartTimeAmongAllRunningTransactions();
 }
 
 }  // namespace tablet

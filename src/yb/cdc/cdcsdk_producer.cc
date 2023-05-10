@@ -1454,10 +1454,11 @@ Status GetChangesForCDCSDK(
   bool report_tablet_split = false;
   OpId split_op_id = OpId::Invalid();
   bool snapshot_operation = false;
-  // TODO(nishantwrp): Implement this function
-  uint64_t consistent_safe_time = 0;
 
   auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet_safe());
+  uint64_t consistent_safe_time = tablet_ptr->transaction_participant()
+                                      ->GetMinStartTimeAmongAllRunningTransactions()
+                                      .ToUint64();
   auto leader_safe_time = tablet_ptr->SafeTime();
   if (!leader_safe_time.ok()) {
     YB_LOG_EVERY_N_SECS(WARNING, 10)
