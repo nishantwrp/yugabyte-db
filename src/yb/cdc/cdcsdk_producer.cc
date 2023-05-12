@@ -1318,8 +1318,6 @@ bool IsUpdateTransactionOp(const std::shared_ptr<yb::consensus::LWReplicateMsg>&
 }
 
 uint64_t GetTransactionCommitTime(const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg) {
-  // if ((!IsWriteOp(msg) && !IsUpdateTransactionOp(msg)) || IsIntent(msg)) {
-  // }
   return IsUpdateTransactionOp(msg) ? msg->transaction_state().commit_hybrid_time()
                                     : msg->hybrid_time();
 }
@@ -1400,14 +1398,11 @@ Status GetConsistentWALRecords(
 
 bool CanUpdateCheckpointOpId(
     const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, size_t* next_checkpoint_index,
-    std::unordered_set<std::shared_ptr<yb::consensus::LWReplicateMsg>>* processed_messages,
     const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints,
     const uint64_t& commit_time) {
   bool update_checkpoint = false;
-  processed_messages->insert(msg);
   while ((*next_checkpoint_index) < all_checkpoints.size() &&
-         (GetTransactionCommitTime(all_checkpoints[*next_checkpoint_index]) <= commit_time ||
-          ContainsKey(*processed_messages, all_checkpoints[*next_checkpoint_index]))) {
+         GetTransactionCommitTime(all_checkpoints[*next_checkpoint_index]) <= commit_time) {
     (*next_checkpoint_index)++;
     update_checkpoint = true;
   }
@@ -1584,7 +1579,6 @@ Status GetChangesForCDCSDK(
     size_t next_checkpoint_index = 0;
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>> consistent_wal_records,
         all_checkpoints;
-    std::unordered_set<std::shared_ptr<yb::consensus::LWReplicateMsg>> processed_messages;
 
     RETURN_NOT_OK(GetConsistentWALRecords(
         tablet_peer, &consistent_wal_records, &all_checkpoints, consistent_stream_safe_time,
@@ -1596,10 +1590,10 @@ Status GetChangesForCDCSDK(
         consistent_wal_records[0]->transaction_state().has_commit_hybrid_time()) {
       commit_timestamp = consistent_wal_records[0]->transaction_state().commit_hybrid_time();
     } else {
-      LOG(WARNING) << "Unable to read the transaction commit time for tablet_id: " << tablet_id
-                   << " with stream_id: " << stream_id
-                   << " because there is no RAFT log message read from WAL with from_op_id: "
-                   << OpId::FromPB(from_op_id) << ", which can impact the safe time.";
+      LOG(ERROR) << "Unable to read the transaction commit time for tablet_id: " << tablet_id
+                 << " with stream_id: " << stream_id
+                 << " because there is no RAFT log message read from WAL with from_op_id: "
+                 << OpId::FromPB(from_op_id) << ", which can impact the safe time.";
     }
 
     RETURN_NOT_OK(reverse_index_key_slice.consume_byte(dockv::KeyEntryTypeAsChar::kTransactionId));
@@ -1613,13 +1607,17 @@ Status GetChangesForCDCSDK(
     if (checkpoint.write_id() == 0 && checkpoint.key().empty() && consistent_wal_records.size()) {
       ht_of_last_returned_message = HybridTime(commit_timestamp);
       if (CanUpdateCheckpointOpId(
-              consistent_wal_records[0], &next_checkpoint_index, &processed_messages,
-              all_checkpoints, ht_of_last_returned_message.ToUint64())) {
+              consistent_wal_records[0], &next_checkpoint_index, all_checkpoints,
+              ht_of_last_returned_message.ToUint64())) {
         int64_t term = all_checkpoints[next_checkpoint_index - 1]->id().term();
         int64_t index = all_checkpoints[next_checkpoint_index - 1]->id().index();
         SetTermIndex(term, index, &checkpoint);
         last_streamed_op_id->term = term;
         last_streamed_op_id->index = index;
+      }
+    } else {
+      if (ht_of_last_returned_message == HybridTime::kInvalid) {
+        ht_of_last_returned_message = HybridTime(safe_hybrid_time);
       }
     }
     checkpoint_updated = true;
@@ -1637,7 +1635,6 @@ Status GetChangesForCDCSDK(
       size_t next_checkpoint_index = 0;
       std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>> consistent_wal_records,
           all_checkpoints;
-      std::unordered_set<std::shared_ptr<yb::consensus::LWReplicateMsg>> processed_messages;
 
       RETURN_NOT_OK(GetConsistentWALRecords(
           tablet_peer, &consistent_wal_records, &all_checkpoints, consistent_stream_safe_time,
@@ -1690,10 +1687,13 @@ Status GetChangesForCDCSDK(
                 pending_intents = true;
                 VLOG(1) << "There are pending intents for the transaction id " << txn_id
                         << " with apply record OpId: " << op_id;
+                if (ht_of_last_returned_message == HybridTime::kInvalid) {
+                  ht_of_last_returned_message = HybridTime(safe_hybrid_time);
+                }
               } else {
                 ht_of_last_returned_message = HybridTime(GetTransactionCommitTime(msg));
                 if (CanUpdateCheckpointOpId(
-                        msg, &next_checkpoint_index, &processed_messages, all_checkpoints,
+                        msg, &next_checkpoint_index, all_checkpoints,
                         ht_of_last_returned_message.ToUint64())) {
                   int64_t term = all_checkpoints[next_checkpoint_index - 1]->id().term();
                   int64_t index = all_checkpoints[next_checkpoint_index - 1]->id().index();
@@ -1717,7 +1717,7 @@ Status GetChangesForCDCSDK(
 
               ht_of_last_returned_message = HybridTime(GetTransactionCommitTime(msg));
               if (CanUpdateCheckpointOpId(
-                      msg, &next_checkpoint_index, &processed_messages, all_checkpoints,
+                      msg, &next_checkpoint_index, all_checkpoints,
                       ht_of_last_returned_message.ToUint64())) {
                 SetCheckpoint(
                     all_checkpoints[next_checkpoint_index - 1]->id().term(),
