@@ -1329,10 +1329,9 @@ void SortConsistentWALRecords(
     const int& non_transaction_ops) {
   std::sort(
       (*consistent_wal_records).begin() + non_transaction_ops, (*consistent_wal_records).end(),
-      [](std::shared_ptr<yb::consensus::LWReplicateMsg> lhs,
-         std::shared_ptr<yb::consensus::LWReplicateMsg>
-             rhs) -> bool {
-        return GetTransactionCommitTime(lhs) <= GetTransactionCommitTime(rhs);
+      [](const std::shared_ptr<yb::consensus::LWReplicateMsg>& lhs,
+         const std::shared_ptr<yb::consensus::LWReplicateMsg>& rhs) -> bool {
+        return GetTransactionCommitTime(lhs) < GetTransactionCommitTime(rhs);
       });
 }
 
@@ -1341,7 +1340,7 @@ Status GetConsistentWALRecords(
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* consistent_wal_records,
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* all_checkpoints,
     const uint64_t& consistent_safe_time, OpId* last_seen_op_id, int64_t** last_readable_opid_index,
-    const int64_t& safe_hybrid_time, const CoarseTimePoint& deadline, bool get_one_record) {
+    const int64_t& safe_hybrid_time, const CoarseTimePoint& deadline) {
   int non_transaction_ops = 0;
   bool found_transaction_op = false;
   bool stop_fetching_messages = false;
@@ -1358,7 +1357,6 @@ Status GetConsistentWALRecords(
     }
 
     for (const auto& msg : read_ops.messages) {
-      LOG(WARNING) << "msg: " << msg->op_type() << " " << msg->hybrid_time();
       if (!IsWriteOp(msg) && !IsUpdateTransactionOp(msg)) {
         if (!found_transaction_op) {
           last_seen_op_id->term = msg->id().term();
@@ -1366,11 +1364,6 @@ Status GetConsistentWALRecords(
 
           non_transaction_ops++;
           consistent_wal_records->push_back(msg);
-          if (get_one_record) {
-            stop_fetching_messages = true;
-            break;
-          }
-
           continue;
         }
 
@@ -1396,10 +1389,6 @@ Status GetConsistentWALRecords(
       if ((int64_t)GetTransactionCommitTime(msg) > safe_hybrid_time) {
         found_transaction_op = true;
         consistent_wal_records->push_back(msg);
-        if (get_one_record) {
-          stop_fetching_messages = true;
-          break;
-        }
       }
     }
   } while ((!stop_fetching_messages) &&
@@ -1417,7 +1406,7 @@ bool CanUpdateCheckpointOpId(
   bool update_checkpoint = false;
   processed_messages->insert(msg);
   while ((*next_checkpoint_index) < all_checkpoints.size() &&
-         (GetTransactionCommitTime(msg) <= commit_time ||
+         (GetTransactionCommitTime(all_checkpoints[*next_checkpoint_index]) <= commit_time ||
           ContainsKey(*processed_messages, all_checkpoints[*next_checkpoint_index]))) {
     (*next_checkpoint_index)++;
     update_checkpoint = true;
@@ -1599,13 +1588,8 @@ Status GetChangesForCDCSDK(
 
     RETURN_NOT_OK(GetConsistentWALRecords(
         tablet_peer, &consistent_wal_records, &all_checkpoints, consistent_stream_safe_time,
-        &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline, true));
+        &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline));
     have_more_messages = HaveMoreMessages(true);
-
-    if (consistent_wal_records.size() != 1) {
-      LOG(WARNING) << "Reading more or less than one raft log message while reading intents, read "
-                   << consistent_wal_records.size() << " instead";
-    }
 
     if (consistent_wal_records.size() > 0 &&
         consistent_wal_records[0]->op_type() == consensus::OperationType::UPDATE_TRANSACTION_OP &&
@@ -1626,7 +1610,7 @@ Status GetChangesForCDCSDK(
         &consumption, &checkpoint, tablet_peer, &keyValueIntents, &stream_state, client,
         cached_schema_details, commit_timestamp));
 
-    if (checkpoint.write_id() == 0 && checkpoint.key().empty()) {
+    if (checkpoint.write_id() == 0 && checkpoint.key().empty() && consistent_wal_records.size()) {
       ht_of_last_returned_message = HybridTime(commit_timestamp);
       if (CanUpdateCheckpointOpId(
               consistent_wal_records[0], &next_checkpoint_index, &processed_messages,
@@ -1657,7 +1641,7 @@ Status GetChangesForCDCSDK(
 
       RETURN_NOT_OK(GetConsistentWALRecords(
           tablet_peer, &consistent_wal_records, &all_checkpoints, consistent_stream_safe_time,
-          &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline, false));
+          &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline));
 
       if (consistent_wal_records.empty()) {
         VLOG_WITH_FUNC(1)
@@ -1913,6 +1897,11 @@ Status GetChangesForCDCSDK(
   auto safe_time = GetCDCSDKSafeTimeForTarget(
       leader_safe_time.get(), ht_of_last_returned_message, have_more_messages);
   resp->set_safe_hybrid_time(safe_time.ToUint64());
+
+  if (checkpoint_updated && !(checkpoint.has_term() && checkpoint.has_index())) {
+    checkpoint.set_term(from_op_id.term());
+    checkpoint.set_index(from_op_id.index());
+  }
 
   checkpoint_updated ? resp->mutable_cdc_sdk_checkpoint()->CopyFrom(checkpoint)
                      : resp->mutable_cdc_sdk_checkpoint()->CopyFrom(from_op_id);

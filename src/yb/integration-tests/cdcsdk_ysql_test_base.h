@@ -120,6 +120,7 @@ DECLARE_uint64(ysql_packed_row_size_limit);
 DECLARE_bool(cdc_populate_safepoint_record);
 DECLARE_string(vmodule);
 DECLARE_int32(ysql_num_shards_per_tserver);
+DECLARE_int32(TEST_txn_participant_inject_latency_on_apply_update_txn_ms);
 
 namespace yb {
 
@@ -2999,6 +3000,20 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
         default:
           ASSERT_FALSE(true);
           break;
+      }
+    }
+  }
+
+  void CheckRecordsConsistency(std::vector<CDCSDKProtoRecordPB> records) {
+    uint64_t prev_commit_time = 0;
+    for (auto& record : records) {
+      if (record.row_message().op() == RowMessage::INSERT ||
+          record.row_message().op() == RowMessage::UPDATE ||
+          record.row_message().op() == RowMessage::DELETE ||
+          record.row_message().op() == RowMessage::BEGIN ||
+          record.row_message().op() == RowMessage::COMMIT) {
+        ASSERT_TRUE(record.row_message().commit_time() >= prev_commit_time);
+        prev_commit_time = record.row_message().commit_time();
       }
     }
   }

@@ -1181,6 +1181,68 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestNeedSchemaInfoFlag)) {
       VerifyIfDDLRecordPresent(stream_id, tablets, true, false, &resp.cdc_sdk_checkpoint()));
 }
 
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithManyTransactions)) {
+  FLAGS_cdc_max_stream_intent_records = 40;
+
+  ASSERT_OK(SetUpWithParams(3, 1, false));
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 1);
+  CDCStreamId stream_id = ASSERT_RESULT(CreateDBStream());
+  auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets, OpId::Min()));
+  ASSERT_FALSE(set_resp.has_error());
+
+  int batch_size = 200;
+  int num_transactions = 150;
+  const int apply_latencies[] = {100, 200, 300, 400, 500, 600, 700};
+  for (int i = 0; i < num_transactions; i++) {
+    int per_transaction_batch = batch_size / 2;
+    int start_id = 2 * i * per_transaction_batch;
+
+    FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = apply_latencies[i % 7];
+    ASSERT_OK(WriteRowsHelper(start_id, start_id + per_transaction_batch, &test_cluster_, true));
+    ASSERT_OK(WriteRows(
+        start_id + per_transaction_batch, start_id + 2 * per_transaction_batch, &test_cluster_));
+  }
+  ASSERT_OK(test_client()->FlushTables({table.table_id()}, false, 1000, false));
+
+  // Wait for all transactions to be applied.
+  SleepFor(MonoDelta::FromSeconds(5));
+
+  // The count array stores counts of DDL, INSERT, UPDATE, DELETE, READ, TRUNCATE in that order.
+  const int expected_count[] = {
+      1, batch_size * num_transactions, 0, 0, 0, 0, num_transactions, num_transactions,
+  };
+  int count[] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+  int num_records = 0;
+  int prev_records = 0;
+  vector<CDCSDKProtoRecordPB> all_records;
+  CDCSDKCheckpointPB prev_checkpoint;
+  do {
+    GetChangesResponsePB change_resp =
+        ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets, &prev_checkpoint));
+
+    for (int i = 0; i < change_resp.cdc_sdk_proto_records_size(); i++) {
+      all_records.push_back(change_resp.cdc_sdk_proto_records(i));
+    }
+    UpdateRecordCount(change_resp.cdc_sdk_proto_records(), count);
+
+    num_records += change_resp.cdc_sdk_proto_records_size();
+    prev_checkpoint = change_resp.cdc_sdk_checkpoint();
+    prev_records = change_resp.cdc_sdk_proto_records_size();
+  } while (prev_records != 0);
+
+  CheckRecordsConsistency(all_records);
+
+  LOG(INFO) << "Got " << num_records << " records.";
+  for (int i = 0; i < 8; i++) {
+    ASSERT_EQ(expected_count[i], count[i]);
+  }
+  ASSERT_EQ(30301, num_records);
+}
+
 TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestEnableTruncateTable)) {
   ASSERT_OK(SetUpWithParams(1, 1, false));
 

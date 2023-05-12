@@ -471,10 +471,38 @@ class TransactionParticipant::Impl
   }
 
   HybridTime GetMinStartTimeAmongAllRunningTransactions() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return transactions_.get<StartTimeTag>().size()
-               ? transactions_.get<StartTimeTag>().begin()->get()->start_ht()
-               : HybridTime::kInvalid;
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (transactions_.get<StartTimeTag>().size() == 0) {
+      return HybridTime::kInvalid;
+    }
+
+    static const std::string kRequestReason = "min running check"s;
+    // Get transaction status
+    auto now_ht = participant_context_.Now();
+
+    for (const auto& transaction : transactions_.get<StartTimeTag>()) {
+      StatusRequest status_request = {
+          .id = &transaction->id(),
+          .read_ht = now_ht,
+          .global_limit_ht = now_ht,
+          // Could use 0 here, because read_ht == global_limit_ht.
+          // So we cannot accept status with time >= read_ht and < global_limit_ht.
+          .serial_no = 0,
+          .reason = &kRequestReason,
+          .flags = TransactionLoadFlags{},
+          .callback = [this, id = transaction->id()](Result<TransactionStatusResult> result) {
+            // Aborted status will result in cleanup of intents.
+            VLOG_WITH_PREFIX(1) << "Min running status " << id << ": " << result;
+          }};
+
+      auto const& transaction_status = transaction->last_known_status();
+      if (transaction_status != TransactionStatus::COMMITTED &&
+          transaction_status != TransactionStatus::ABORTED) {
+        return transaction->start_ht();
+      }
+    }
+
+    return HybridTime::kInvalid;
   }
 
   OpId GetRetainOpId() {
