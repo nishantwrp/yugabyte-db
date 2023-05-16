@@ -2349,16 +2349,10 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
       ASSERT_OK(test_cluster()->mini_tablet_server(idx)->WaitStarted());
     }
 
-    GetChangesResponsePB change_resp;
-    auto result = GetChangesFromCDC(stream_id, tablets);
-    if (!result.ok()) {
-      ASSERT_OK(result);
-    }
-    change_resp = *result;
-
-    uint32_t record_size = change_resp.cdc_sdk_proto_records_size();
+    auto change_resp = GetAllPendingChangesFromCdc(stream_id, tablets);
+    size_t record_size = change_resp.records.size();
     for (uint32_t idx = 0; idx < record_size; idx++) {
-      const CDCSDKProtoRecordPB record = change_resp.cdc_sdk_proto_records(idx);
+      const CDCSDKProtoRecordPB record = change_resp.records[idx];
       std::stringstream s;
       for (int jdx = 0; jdx < record.row_message().new_tuple_size(); jdx++) {
         s << " " << record.row_message().new_tuple(jdx).datum_int32();
@@ -2697,16 +2691,10 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
     LOG(INFO) << "All nodes restarted";
     SleepFor(MonoDelta::FromSeconds(10));
 
-    GetChangesResponsePB change_resp;
-    auto result = GetChangesFromCDC(stream_id, tablets);
-    if (!result.ok()) {
-      ASSERT_OK(result);
-    }
-    change_resp = *result;
-
-    uint32_t record_size = change_resp.cdc_sdk_proto_records_size();
+    auto change_resp = GetAllPendingChangesFromCdc(stream_id, tablets);
+    size_t record_size = change_resp.records.size();
     for (uint32_t idx = 0; idx < record_size; idx++) {
-      const CDCSDKProtoRecordPB record = change_resp.cdc_sdk_proto_records(idx);
+      const CDCSDKProtoRecordPB record = change_resp.records[idx];
       std::stringstream s;
       if (record.row_message().op() == RowMessage_Op::RowMessage_Op_INSERT) {
         auto key_value = record.row_message().new_tuple(0).datum_int32();
@@ -2856,16 +2844,11 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
     auto resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
     ASSERT_FALSE(resp.has_error());
 
-    GetChangesResponsePB change_resp;
-    auto result = GetChangesFromCDC(stream_id, tablets);
-    if (!result.ok()) {
-      ASSERT_OK(result);
-    }
-    change_resp = *result;
+    auto change_resp = GetAllPendingChangesFromCdc(stream_id, tablets);
+    size_t record_size = change_resp.records.size();
 
-    uint32_t record_size = change_resp.cdc_sdk_proto_records_size();
     for (uint32_t idx = 0; idx < record_size; idx++) {
-      const CDCSDKProtoRecordPB record = change_resp.cdc_sdk_proto_records(idx);
+      const CDCSDKProtoRecordPB record = change_resp.records[idx];
       std::stringstream s;
       if (record.row_message().op() == RowMessage_Op::RowMessage_Op_INSERT) {
         auto key_value = record.row_message().new_tuple(0).datum_int32();
@@ -3100,23 +3083,57 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
   }
 
   void PerformSingleAndMultiShardInserts(
-      const int& num_iter, const int& inserts_per_iter, bool inject_latencies = false,
+      const int& num_batches, const int& inserts_per_batch, bool inject_latencies = false,
       const int& start_index = 0) {
     std::mt19937 rng;
     Seed(&rng);
     std::uniform_int_distribution<int> random_latency(0, 1000);
 
-    for (int i = 0; i < num_iter; i++) {
-      int multi_shard_inserts = inserts_per_iter / 2;
-      int curr_start_id = start_index + i * inserts_per_iter;
+    for (int i = 0; i < num_batches; i++) {
+      int multi_shard_inserts = inserts_per_batch / 2;
+      int curr_start_id = start_index + i * inserts_per_batch;
 
       if (inject_latencies)
         FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = random_latency(rng);
+      else
+        FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = 0;
 
       ASSERT_OK(WriteRowsHelper(
           curr_start_id, curr_start_id + multi_shard_inserts, &test_cluster_, true));
+
+      FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = 0;
       ASSERT_OK(WriteRows(
-          curr_start_id + multi_shard_inserts, curr_start_id + inserts_per_iter, &test_cluster_));
+          curr_start_id + multi_shard_inserts, curr_start_id + inserts_per_batch, &test_cluster_));
+    }
+  }
+
+  void PerformSingleAndMultiShardQueries(
+      const int& num_batches, const int& queries_per_batch, const string& query,
+      bool inject_latencies = false, const int& start_index = 0) {
+    std::mt19937 rng;
+    Seed(&rng);
+    std::uniform_int_distribution<int> random_latency(0, 100);
+
+    auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(kNamespaceName));
+    for (int i = 0; i < num_batches; i++) {
+      int multi_shard_queries = queries_per_batch / 2;
+      int curr_start_id = start_index + i * queries_per_batch;
+
+      if (inject_latencies)
+        FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = random_latency(rng);
+      else
+        FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = 0;
+
+      ASSERT_OK(conn.Execute("BEGIN"));
+      for (int i = 0; i < multi_shard_queries; i++) {
+        ASSERT_OK(conn.ExecuteFormat(query, curr_start_id + i + 1));
+      }
+      ASSERT_OK(conn.Execute("COMMIT"));
+
+      FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = 0;
+      for (int i = 0; i < (queries_per_batch - multi_shard_queries); i++) {
+        ASSERT_OK(conn.ExecuteFormat(query, curr_start_id + multi_shard_queries + i + 1));
+      }
     }
   }
 

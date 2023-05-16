@@ -1322,6 +1322,15 @@ uint64_t GetTransactionCommitTime(const std::shared_ptr<yb::consensus::LWReplica
                                     : msg->hybrid_time();
 }
 
+bool IsNonActionableMessage(const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg) {
+  return msg->op_type() == consensus::OperationType::UNKNOWN_OP ||
+         msg->op_type() == consensus::OperationType::NO_OP ||
+         msg->op_type() == consensus::OperationType::CHANGE_CONFIG_OP ||
+         msg->op_type() == consensus::OperationType::SNAPSHOT_OP ||
+         msg->op_type() == consensus::OperationType::HISTORY_CUTOFF_OP ||
+         msg->op_type() == consensus::OperationType::CHANGE_AUTO_FLAGS_CONFIG_OP;
+}
+
 void SortConsistentWALRecords(
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* consistent_wal_records,
     const int& non_transaction_ops) {
@@ -1331,6 +1340,15 @@ void SortConsistentWALRecords(
          const std::shared_ptr<yb::consensus::LWReplicateMsg>& rhs) -> bool {
         return GetTransactionCommitTime(lhs) < GetTransactionCommitTime(rhs);
       });
+
+  for (size_t i = non_transaction_ops; i < consistent_wal_records->size(); i++) {
+    if (i > 0) {
+      if ((*consistent_wal_records)[i]->id().index() <
+          (*consistent_wal_records)[i - 1]->id().index()) {
+        LOG(WARNING) << "---------- out of order wal records ---------";
+      }
+    }
+  }
 }
 
 Status GetConsistentWALRecords(
@@ -1355,6 +1373,14 @@ Status GetConsistentWALRecords(
     }
 
     for (const auto& msg : read_ops.messages) {
+      if (IsNonActionableMessage(msg) || IsIntent(msg) ||
+          (IsUpdateTransactionOp(msg) &&
+           msg->transaction_state().status() != TransactionStatus::APPLYING)) {
+        last_seen_op_id->term = msg->id().term();
+        last_seen_op_id->index = msg->id().index();
+        continue;
+      }
+
       if (!IsWriteOp(msg) && !IsUpdateTransactionOp(msg)) {
         if (!found_transaction_op) {
           last_seen_op_id->term = msg->id().term();
@@ -1367,13 +1393,6 @@ Status GetConsistentWALRecords(
 
         stop_fetching_messages = true;
         break;
-      }
-
-      if (IsIntent(msg) || (IsUpdateTransactionOp(msg) &&
-                            msg->transaction_state().status() != TransactionStatus::APPLYING)) {
-        last_seen_op_id->term = msg->id().term();
-        last_seen_op_id->index = msg->id().index();
-        continue;
       }
 
       if (GetTransactionCommitTime(msg) > consistent_safe_time) {
@@ -1590,6 +1609,7 @@ Status GetChangesForCDCSDK(
         consistent_wal_records[0]->transaction_state().has_commit_hybrid_time()) {
       commit_timestamp = consistent_wal_records[0]->transaction_state().commit_hybrid_time();
     } else {
+      LOG(WARNING) << "debug issue 1: " << consistent_wal_records[0]->ShortDebugString();
       LOG(ERROR) << "Unable to read the transaction commit time for tablet_id: " << tablet_id
                  << " with stream_id: " << stream_id
                  << " because there is no RAFT log message read from WAL with from_op_id: "
@@ -1624,8 +1644,6 @@ Status GetChangesForCDCSDK(
   } else {
     RequestScope request_scope;
     OpId last_seen_op_id = op_id;
-    // Last seen OpId of a non-actionable message.
-    OpId last_seen_default_message_op_id = OpId().Invalid();
 
     // It's possible that a batch of messages in read_ops after fetching from
     // 'ReadReplicatedMessagesForCDC' , will not have any actionable messages. In which case we
@@ -1785,11 +1803,12 @@ Status GetChangesForCDCSDK(
             if (FLAGS_stream_truncate_record) {
               RETURN_NOT_OK(PopulateCDCSDKTruncateRecord(
                   msg, resp->add_cdc_sdk_proto_records(), current_schema));
-              SetCheckpoint(
-                  msg->id().term(), msg->id().index(), 0, "", 0, &checkpoint, last_streamed_op_id);
-              ht_of_last_returned_message = HybridTime(msg->hybrid_time());
               checkpoint_updated = true;
             }
+
+            SetCheckpoint(
+                msg->id().term(), msg->id().index(), 0, "", 0, &checkpoint, last_streamed_op_id);
+            ht_of_last_returned_message = HybridTime(msg->hybrid_time());
           } break;
 
           case yb::consensus::OperationType::SPLIT_OP: {
@@ -1835,7 +1854,8 @@ Status GetChangesForCDCSDK(
 
           default:
             // Nothing to do for other operation types.
-            last_seen_default_message_op_id = OpId(msg->id().term(), msg->id().index());
+            SetCheckpoint(
+                msg->id().term(), msg->id().term(), 0, "", 0, &checkpoint, last_streamed_op_id);
             ht_of_last_returned_message = HybridTime(msg->hybrid_time());
             VLOG_WITH_FUNC(2) << "Found message of Op type: " << msg->op_type()
                               << ", on tablet: " << tablet_id
@@ -1863,23 +1883,6 @@ Status GetChangesForCDCSDK(
 
     } while (!checkpoint_updated && last_readable_opid_index &&
              last_seen_op_id.index < *last_readable_opid_index);
-
-    // In case the checkpoint was not updated at-all, we will update the checkpoint using the last
-    // seen non-actionable message.
-    if (!checkpoint_updated) {
-      have_more_messages = HaveMoreMessages(false);
-      if (last_seen_default_message_op_id != OpId::Invalid()) {
-        SetCheckpoint(
-            last_seen_default_message_op_id.term, last_seen_default_message_op_id.index, 0, "", 0,
-            &checkpoint, last_streamed_op_id);
-        checkpoint_updated = true;
-        VLOG_WITH_FUNC(2)
-            << "The last batch of 'read_ops' had no actionable message"
-            << ", on tablet: " << tablet_id
-            << ". The checkpoint will be updated based on the last message's OpId to: "
-            << last_seen_default_message_op_id;
-      }
-    }
   }
 
   // If the split_op_id is equal to the checkpoint i.e the OpId of the last actionable message, we

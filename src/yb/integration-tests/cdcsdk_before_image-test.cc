@@ -86,13 +86,12 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestSchemaChangeBeforeImage)) {
   ExpectedRecordWithThreeColumns expected_before_image_records[] = {
       {}, {}, {1, 2, INT_MAX}, {}, {1, 3, INT_MAX}, {}, {1, 4, INT_MAX}, {4, 5, 6}, {4, 99, 6}};
 
-  GetChangesResponsePB change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
-
+  auto change_resp = GetAllPendingChangesFromCdc(stream_id, tablets);
   // If the packed row is enabled and there are multiple tables altered, if CDC fail to get before
   // image row with the current running schema version, then it will ignore the before image tuples.
-  uint32_t record_size = change_resp.cdc_sdk_proto_records_size();
+  size_t record_size = change_resp.records.size();
   for (uint32_t i = 0; i < record_size; ++i) {
-    const CDCSDKProtoRecordPB record = change_resp.cdc_sdk_proto_records(i);
+    const CDCSDKProtoRecordPB record = change_resp.records[i];
     if (i <= 6) {
       CheckRecordWithThreeColumns(
           record, expected_records[i], count, true, expected_before_image_records[i]);
@@ -767,11 +766,10 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestColumnDropBeforeImage)) {
   ExpectedRecordWithThreeColumns expected_before_image_records[] = {
       {}, {}, {1, 2, INT_MAX}, {}, {1, 3, INT_MAX}, {}};
 
-  GetChangesResponsePB change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
-
-  uint32_t record_size = change_resp.cdc_sdk_proto_records_size();
+  auto change_resp = GetAllPendingChangesFromCdc(stream_id, tablets);
+  size_t record_size = change_resp.records.size();
   for (uint32_t i = 0; i < record_size; ++i) {
-    const CDCSDKProtoRecordPB record = change_resp.cdc_sdk_proto_records(i);
+    const CDCSDKProtoRecordPB record = change_resp.records[i];
     CheckRecordWithThreeColumns(
         record, expected_records[i], count, true, expected_before_image_records[i]);
   }
