@@ -1340,15 +1340,6 @@ void SortConsistentWALRecords(
          const std::shared_ptr<yb::consensus::LWReplicateMsg>& rhs) -> bool {
         return GetTransactionCommitTime(lhs) < GetTransactionCommitTime(rhs);
       });
-
-  for (size_t i = non_transaction_ops; i < consistent_wal_records->size(); i++) {
-    if (i > 0) {
-      if ((*consistent_wal_records)[i]->id().index() <
-          (*consistent_wal_records)[i - 1]->id().index()) {
-        LOG(WARNING) << "---------- out of order wal records ---------";
-      }
-    }
-  }
 }
 
 Status GetConsistentWALRecords(
