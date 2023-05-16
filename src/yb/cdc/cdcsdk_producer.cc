@@ -1644,6 +1644,7 @@ Status GetChangesForCDCSDK(
   } else {
     RequestScope request_scope;
     OpId last_seen_op_id = op_id;
+    bool saw_non_actionable_message = false;
 
     // It's possible that a batch of messages in read_ops after fetching from
     // 'ReadReplicatedMessagesForCDC' , will not have any actionable messages. In which case we
@@ -1804,6 +1805,8 @@ Status GetChangesForCDCSDK(
               RETURN_NOT_OK(PopulateCDCSDKTruncateRecord(
                   msg, resp->add_cdc_sdk_proto_records(), current_schema));
               checkpoint_updated = true;
+            } else {
+              saw_non_actionable_message = true;
             }
 
             SetCheckpoint(
@@ -1854,6 +1857,7 @@ Status GetChangesForCDCSDK(
 
           default:
             // Nothing to do for other operation types.
+            saw_non_actionable_message = true;
             SetCheckpoint(
                 msg->id().term(), msg->id().term(), 0, "", 0, &checkpoint, last_streamed_op_id);
             ht_of_last_returned_message = HybridTime(msg->hybrid_time());
@@ -1883,6 +1887,16 @@ Status GetChangesForCDCSDK(
 
     } while (!checkpoint_updated && last_readable_opid_index &&
              last_seen_op_id.index < *last_readable_opid_index);
+
+    // In case the checkpoint was not updated at-all, we will update the checkpoint using the last
+    // seen non-actionable message.
+    if (saw_non_actionable_message && !checkpoint_updated) {
+      have_more_messages = HaveMoreMessages(false);
+      checkpoint_updated = true;
+      VLOG_WITH_FUNC(2) << "The last batch of 'read_ops' had no actionable message"
+                        << ", on tablet: " << tablet_id
+                        << ". The checkpoint will be updated based on the last message's OpId";
+    }
   }
 
   // If the split_op_id is equal to the checkpoint i.e the OpId of the last actionable message, we
