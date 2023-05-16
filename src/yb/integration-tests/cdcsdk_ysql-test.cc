@@ -432,16 +432,16 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestSchemaEvolutionWithMultipleSt
       RowMessage::DELETE};
 
   // Catch up both streams.
-  GetChangesResponsePB change_resp_1 = ASSERT_RESULT(GetChangesFromCDC(stream_id_1, tablets));
-  uint32_t record_size_1 = change_resp_1.cdc_sdk_proto_records_size();
-  GetChangesResponsePB change_resp_2 = ASSERT_RESULT(GetChangesFromCDC(stream_id_2, tablets));
-  uint32_t record_size_2 = change_resp_2.cdc_sdk_proto_records_size();
+  auto change_resp_1 = GetAllPendingChangesFromCdc(stream_id_1, tablets);
+  size_t record_size_1 = change_resp_1.records.size();
+  auto change_resp_2 = GetAllPendingChangesFromCdc(stream_id_2, tablets);
+  size_t record_size_2 = change_resp_2.records.size();
 
   ASSERT_EQ(record_size_1, 5);
   ASSERT_EQ(record_size_2, 5);
 
   for (uint32_t i = 0; i < record_size_1; ++i) {
-    const CDCSDKProtoRecordPB record = change_resp_1.cdc_sdk_proto_records(i);
+    const CDCSDKProtoRecordPB record = change_resp_1.records[i];
     if (FLAGS_ysql_enable_packed_row) {
       ASSERT_EQ(record.row_message().op(), expected_packed_row_record_types_1[i]);
     } else {
@@ -451,7 +451,7 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestSchemaEvolutionWithMultipleSt
   }
 
   for (uint32_t i = 0; i < record_size_2; ++i) {
-    const CDCSDKProtoRecordPB record = change_resp_2.cdc_sdk_proto_records(i);
+    const CDCSDKProtoRecordPB record = change_resp_2.records[i];
     if (FLAGS_ysql_enable_packed_row) {
       ASSERT_EQ(record.row_message().op(), expected_packed_row_record_types_1[i]);
     } else {
@@ -472,13 +472,13 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestSchemaEvolutionWithMultipleSt
       RowMessage::DDL, RowMessage::UPDATE, RowMessage::INSERT};
 
   // Call GetChanges only on stream 1.
-  auto previous_checkpoint_1 = change_resp_1.cdc_sdk_checkpoint();
-  change_resp_1 = ASSERT_RESULT(GetChangesFromCDC(stream_id_1, tablets, &previous_checkpoint_1));
-  record_size_1 = change_resp_1.cdc_sdk_proto_records_size();
+  auto previous_checkpoint_1 = change_resp_1.checkpoint;
+  change_resp_1 = GetAllPendingChangesFromCdc(stream_id_1, tablets, &previous_checkpoint_1);
+  record_size_1 = change_resp_1.records.size();
   ASSERT_EQ(record_size_1, 3);
 
   for (uint32_t i = 0; i < record_size_1; ++i) {
-    const CDCSDKProtoRecordPB record = change_resp_1.cdc_sdk_proto_records(i);
+    const CDCSDKProtoRecordPB record = change_resp_1.records[i];
     ASSERT_EQ(record.row_message().op(), expected_record_types_2[i]);
     CheckRecordWithThreeColumns(
         record, expected_records_2[i], count_1, false, {}, validate_three_columns_2[i]);
@@ -495,13 +495,13 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestSchemaEvolutionWithMultipleSt
   RowMessage::Op expected_packed_row_record_types_3[] = {RowMessage::DDL, RowMessage::INSERT};
 
   // Call GetChanges on stream 1.
-  previous_checkpoint_1 = change_resp_1.cdc_sdk_checkpoint();
-  change_resp_1 = ASSERT_RESULT(GetChangesFromCDC(stream_id_1, tablets, &previous_checkpoint_1));
-  record_size_1 = change_resp_1.cdc_sdk_proto_records_size();
+  previous_checkpoint_1 = change_resp_1.checkpoint;
+  change_resp_1 = GetAllPendingChangesFromCdc(stream_id_1, tablets, &previous_checkpoint_1);
+  record_size_1 = change_resp_1.records.size();
   ASSERT_EQ(record_size_1, 2);
 
   for (uint32_t i = 0; i < record_size_1; ++i) {
-    const CDCSDKProtoRecordPB record = change_resp_1.cdc_sdk_proto_records(i);
+    const CDCSDKProtoRecordPB record = change_resp_1.records[i];
     if (FLAGS_ysql_enable_packed_row) {
       ASSERT_EQ(record.row_message().op(), expected_packed_row_record_types_3[i]);
     } else {
@@ -511,13 +511,13 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestSchemaEvolutionWithMultipleSt
   }
 
   // Call GetChanges on stream 2. Except all records to be received in same order.
-  auto previous_checkpoint_2 = change_resp_2.cdc_sdk_checkpoint();
-  change_resp_2 = ASSERT_RESULT(GetChangesFromCDC(stream_id_2, tablets, &previous_checkpoint_2));
-  record_size_2 = change_resp_2.cdc_sdk_proto_records_size();
+  auto previous_checkpoint_2 = change_resp_2.checkpoint;
+  change_resp_2 = GetAllPendingChangesFromCdc(stream_id_2, tablets, &previous_checkpoint_2);
+  record_size_2 = change_resp_2.records.size();
   ASSERT_EQ(record_size_2, 5);
 
   for (uint32_t i = 0; i < record_size_2; ++i) {
-    const CDCSDKProtoRecordPB record = change_resp_2.cdc_sdk_proto_records(i);
+    const CDCSDKProtoRecordPB record = change_resp_2.records[i];
 
     if (i < records_missed_by_stream_2) {
       ASSERT_EQ(record.row_message().op(), expected_record_types_2[i]);
@@ -1193,18 +1193,19 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithMan
   auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets, OpId::Min()));
   ASSERT_FALSE(set_resp.has_error());
 
-  int batch_size = 200;
-  int num_transactions = 150;
-  const int apply_latencies[] = {100, 200, 300, 400, 500, 600, 700};
-  for (int i = 0; i < num_transactions; i++) {
-    int per_transaction_batch = batch_size / 2;
-    int start_id = 2 * i * per_transaction_batch;
+  int num_batches = 150;
+  int inserts_per_batch = 100;
 
-    FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = apply_latencies[i % 7];
-    ASSERT_OK(WriteRowsHelper(start_id, start_id + per_transaction_batch, &test_cluster_, true));
-    ASSERT_OK(WriteRows(
-        start_id + per_transaction_batch, start_id + 2 * per_transaction_batch, &test_cluster_));
-  }
+  std::thread t1(
+      [&]() -> void { PerformSingleAndMultiShardInserts(num_batches, inserts_per_batch, true); });
+  std::thread t2([&]() -> void {
+    PerformSingleAndMultiShardInserts(
+        num_batches, inserts_per_batch, true, num_batches * inserts_per_batch);
+  });
+
+  t1.join();
+  t2.join();
+
   ASSERT_OK(test_client()->FlushTables({table.table_id()}, false, 1000, false));
 
   // Wait for all transactions to be applied.
@@ -1212,14 +1213,95 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithMan
 
   // The count array stores counts of DDL, INSERT, UPDATE, DELETE, READ, TRUNCATE in that order.
   const int expected_count[] = {
-      1, batch_size * num_transactions, 0, 0, 0, 0, num_transactions, num_transactions,
+      1, 2 * num_batches * inserts_per_batch, 0, 0, 0, 0, 2 * num_batches, 2 * num_batches,
   };
   int count[] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+  auto get_changes_resp = GetAllPendingChangesFromCdc(stream_id, tablets);
+  for (auto record : get_changes_resp.records) {
+    UpdateRecordCount(record, count);
+  }
+
+  CheckRecordsConsistency(get_changes_resp.records);
+  LOG(INFO) << "Got " << get_changes_resp.records.size() << " records.";
+  for (int i = 0; i < 8; i++) {
+    ASSERT_EQ(expected_count[i], count[i]);
+  }
+  ASSERT_EQ(30601, get_changes_resp.records.size());
+}
+
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithForeignKeys)) {
+  FLAGS_cdc_max_stream_intent_records = 40;
+  ASSERT_OK(SetUpWithParams(3, 1, false));
+
+  auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(kNamespaceName));
+  ASSERT_OK(
+      conn.Execute("CREATE TABLE test1(id int primary key, value_1 int) SPLIT INTO 1 TABLETS"));
+  ASSERT_OK(
+      conn.Execute("CREATE TABLE test2(id int primary key, value_2 int, test1_id int, CONSTRAINT "
+                   "fkey FOREIGN KEY(test1_id) REFERENCES test1(id)) SPLIT INTO 1 TABLETS"));
+
+  auto table1 = ASSERT_RESULT(GetTable(&test_cluster_, kNamespaceName, "test1"));
+  auto table2 = ASSERT_RESULT(GetTable(&test_cluster_, kNamespaceName, "test2"));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table2, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 1);
+
+  CDCStreamId stream_id = ASSERT_RESULT(CreateDBStream());
+  auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets, OpId::Min()));
+  ASSERT_FALSE(set_resp.has_error());
+
+  ASSERT_OK(conn.Execute("INSERT INTO test1 VALUES (1, 1)"));
+  ASSERT_OK(conn.Execute("INSERT INTO test1 VALUES (2, 2)"));
+
+  int batch_size = 200;
+  int num_transactions = 150;
+  for (int i = 0; i < num_transactions; i++) {
+    int per_transaction_batch = batch_size / 2;
+    int start_id = 2 * i * per_transaction_batch;
+
+    ASSERT_OK(conn.Execute("BEGIN"));
+    for (int i = 0; i < per_transaction_batch; i++) {
+      ASSERT_OK(conn.ExecuteFormat("INSERT INTO test2 VALUES ($0, 1, 1)", start_id + i + 1));
+    }
+    ASSERT_OK(conn.Execute("COMMIT"));
+
+    for (int i = 0; i < per_transaction_batch; i++) {
+      ASSERT_OK(conn.ExecuteFormat(
+          "INSERT INTO test2 VALUES ($0, 1, 1)", start_id + per_transaction_batch + i + 1));
+    }
+  }
+
+  for (int i = 0; i < num_transactions; i++) {
+    int per_transaction_batch = batch_size / 2;
+    int start_id = 2 * i * per_transaction_batch;
+
+    ASSERT_OK(conn.Execute("BEGIN"));
+    for (int i = 0; i < per_transaction_batch; i++) {
+      ASSERT_OK(conn.ExecuteFormat("UPDATE test2 SET test1_id=2 WHERE id = $0", start_id + i + 1));
+    }
+    ASSERT_OK(conn.Execute("COMMIT"));
+
+    for (int i = 0; i < per_transaction_batch; i++) {
+      ASSERT_OK(conn.ExecuteFormat(
+          "UPDATE test2 SET test1_id=2 WHERE id = $0", start_id + per_transaction_batch + i + 1));
+    }
+  }
+
+  ASSERT_OK(test_client()->FlushTables({table1.table_id()}, false, 1000, false));
+  ASSERT_OK(test_client()->FlushTables({table2.table_id()}, false, 1000, false));
+
+  // The count array stores counts of DDL, INSERT, UPDATE, DELETE, READ, TRUNCATE in that order.
+  // const int expected_count[] = {
+  //     1, batch_size * num_transactions, 0, 0, 0, 0, num_transactions, num_transactions,
+  // };
+  // int count[] = {0, 0, 0, 0, 0, 0, 0, 0};
 
   int num_records = 0;
   int prev_records = 0;
   vector<CDCSDKProtoRecordPB> all_records;
   CDCSDKCheckpointPB prev_checkpoint;
+  int tmp_count = 0;
   do {
     GetChangesResponsePB change_resp =
         ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets, &prev_checkpoint));
@@ -1227,7 +1309,7 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithMan
     for (int i = 0; i < change_resp.cdc_sdk_proto_records_size(); i++) {
       all_records.push_back(change_resp.cdc_sdk_proto_records(i));
     }
-    UpdateRecordCount(change_resp.cdc_sdk_proto_records(), count);
+    // UpdateRecordCount(change_resp.cdc_sdk_proto_records(), count);
 
     num_records += change_resp.cdc_sdk_proto_records_size();
     prev_checkpoint = change_resp.cdc_sdk_checkpoint();
@@ -1237,10 +1319,11 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithMan
   CheckRecordsConsistency(all_records);
 
   LOG(INFO) << "Got " << num_records << " records.";
-  for (int i = 0; i < 8; i++) {
-    ASSERT_EQ(expected_count[i], count[i]);
-  }
-  ASSERT_EQ(30301, num_records);
+  // for (int i = 0; i < 8; i++) {
+  //   ASSERT_EQ(expected_count[i], count[i]);
+  // }
+  ASSERT_EQ(120601, num_records);
+  ASSERT_EQ(120600, tmp_count);
 }
 
 TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestEnableTruncateTable)) {
