@@ -1850,7 +1850,7 @@ Status GetChangesForCDCSDK(
             // Nothing to do for other operation types.
             saw_non_actionable_message = true;
             SetCheckpoint(
-                msg->id().term(), msg->id().term(), 0, "", 0, &checkpoint, last_streamed_op_id);
+                msg->id().term(), msg->id().index(), 0, "", 0, &checkpoint, last_streamed_op_id);
             ht_of_last_returned_message = HybridTime(msg->hybrid_time());
             VLOG_WITH_FUNC(2) << "Found message of Op type: " << msg->op_type()
                               << ", on tablet: " << tablet_id
