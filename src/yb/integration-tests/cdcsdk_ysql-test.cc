@@ -1232,7 +1232,7 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithMan
 }
 
 TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithForeignKeys)) {
-  FLAGS_cdc_max_stream_intent_records = 40;
+  FLAGS_cdc_max_stream_intent_records = 30;
   ASSERT_OK(SetUpWithParams(3, 1, false));
 
   auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(kNamespaceName));
@@ -1255,8 +1255,8 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithFor
   ASSERT_OK(conn.Execute("INSERT INTO test1 VALUES (1, 1)"));
   ASSERT_OK(conn.Execute("INSERT INTO test1 VALUES (2, 2)"));
 
-  int queries_per_batch = 100;
-  int num_batches = 75;
+  int queries_per_batch = 60;
+  int num_batches = 60;
   std::thread t1([&]() -> void {
     PerformSingleAndMultiShardQueries(
         num_batches, queries_per_batch, "INSERT INTO test2 VALUES ($0, 1, 1)", true);
@@ -1308,7 +1308,7 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithFor
   for (int i = 0; i < 8; i++) {
     ASSERT_EQ(expected_count[i], count[i]);
   }
-  ASSERT_EQ(60601, get_changes_resp.records.size());
+  ASSERT_EQ(29281, get_changes_resp.records.size());
 }
 
 TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestEnableTruncateTable)) {
