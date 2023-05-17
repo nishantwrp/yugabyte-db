@@ -1322,15 +1322,6 @@ uint64_t GetTransactionCommitTime(const std::shared_ptr<yb::consensus::LWReplica
                                     : msg->hybrid_time();
 }
 
-bool IsNonActionableMessage(const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg) {
-  return msg->op_type() == consensus::OperationType::UNKNOWN_OP ||
-         msg->op_type() == consensus::OperationType::NO_OP ||
-         msg->op_type() == consensus::OperationType::CHANGE_CONFIG_OP ||
-         msg->op_type() == consensus::OperationType::SNAPSHOT_OP ||
-         msg->op_type() == consensus::OperationType::HISTORY_CUTOFF_OP ||
-         msg->op_type() == consensus::OperationType::CHANGE_AUTO_FLAGS_CONFIG_OP;
-}
-
 void SortConsistentWALRecords(
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* consistent_wal_records,
     const int& non_transaction_ops) {
@@ -1364,9 +1355,8 @@ Status GetConsistentWALRecords(
     }
 
     for (const auto& msg : read_ops.messages) {
-      if (IsNonActionableMessage(msg) || IsIntent(msg) ||
-          (IsUpdateTransactionOp(msg) &&
-           msg->transaction_state().status() != TransactionStatus::APPLYING)) {
+      if (IsIntent(msg) || (IsUpdateTransactionOp(msg) &&
+                            msg->transaction_state().status() != TransactionStatus::APPLYING)) {
         last_seen_op_id->term = msg->id().term();
         last_seen_op_id->index = msg->id().index();
         continue;

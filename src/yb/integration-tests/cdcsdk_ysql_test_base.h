@@ -164,7 +164,7 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
   struct GetAllPendingChangesResponse {
     vector<CDCSDKProtoRecordPB> records;
     CDCSDKCheckpointPB checkpoint;
-    int64 hybrid_safe_time = -1;
+    int64 safe_hybrid_time = -1;
   };
 
   Result<string> GetUniverseId(Cluster* cluster) {
@@ -1527,7 +1527,7 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
     } while (prev_records != 0);
 
     resp.checkpoint = prev_checkpoint;
-    resp.hybrid_safe_time = prev_safetime;
+    resp.safe_hybrid_time = prev_safetime;
     return resp;
   }
 

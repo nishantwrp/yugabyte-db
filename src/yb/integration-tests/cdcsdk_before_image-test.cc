@@ -996,10 +996,10 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestMultipleTableAlterWithBeforeI
       {4, 2, INT_MAX}, {0, 0, INT_MAX}, {1, 3, INT_MAX}};
   ExpectedRecordWithThreeColumns expected_before_image_records[] = {
       {}, {}, {}, {}, {}, {}, {1, 2, INT_MAX}};
-  GetChangesResponsePB change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
-  uint32_t record_size = change_resp.cdc_sdk_proto_records_size();
+  auto change_resp = GetAllPendingChangesFromCdc(stream_id, tablets);
+  size_t record_size = change_resp.records.size();
   for (uint32_t i = 0; i < record_size; ++i) {
-    const CDCSDKProtoRecordPB record = change_resp.cdc_sdk_proto_records(i);
+    const CDCSDKProtoRecordPB record = change_resp.records[i];
     CheckRecordWithThreeColumns(
         record, expected_records[i], count, true, expected_before_image_records[i]);
   }
@@ -1034,11 +1034,10 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestMultipleTableAlterWithBeforeI
   ExpectedRecordWithThreeColumns expected_before_image_records_2[] = {
       {1, 3, INT_MAX}, {1, 3, 4}, {}, {1, 3, INT_MAX}, {1, 5, INT_MAX}};
 
-  GetChangesResponsePB change_resp_2 =
-      ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets, &change_resp.cdc_sdk_checkpoint()));
-  uint32_t record_size_2 = change_resp_2.cdc_sdk_proto_records_size();
+  auto change_resp_2 = GetAllPendingChangesFromCdc(stream_id, tablets, &change_resp.checkpoint);
+  size_t record_size_2 = change_resp_2.records.size();
   for (uint32_t i = 0; i < record_size_2; ++i) {
-    const CDCSDKProtoRecordPB record = change_resp_2.cdc_sdk_proto_records(i);
+    const CDCSDKProtoRecordPB record = change_resp_2.records[i];
     CheckRecordWithThreeColumns(
         record, expected_records_2[i], count_2, true, expected_before_image_records_2[i]);
   }
