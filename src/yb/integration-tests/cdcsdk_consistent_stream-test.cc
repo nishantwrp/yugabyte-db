@@ -31,10 +31,10 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithMan
   int inserts_per_batch = 100;
 
   std::thread t1(
-      [&]() -> void { PerformSingleAndMultiShardInserts(num_batches, inserts_per_batch, true); });
+      [&]() -> void { PerformSingleAndMultiShardInserts(num_batches, inserts_per_batch, 20); });
   std::thread t2([&]() -> void {
     PerformSingleAndMultiShardInserts(
-        num_batches, inserts_per_batch, true, num_batches * inserts_per_batch);
+        num_batches, inserts_per_batch, 50, num_batches * inserts_per_batch);
   });
 
   t1.join();
@@ -93,11 +93,11 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithFor
   int num_batches = 60;
   std::thread t1([&]() -> void {
     PerformSingleAndMultiShardQueries(
-        num_batches, queries_per_batch, "INSERT INTO test2 VALUES ($0, 1, 1)", true);
+        num_batches, queries_per_batch, "INSERT INTO test2 VALUES ($0, 1, 1)", 20);
   });
   std::thread t2([&]() -> void {
     PerformSingleAndMultiShardQueries(
-        num_batches, queries_per_batch, "INSERT INTO test2 VALUES ($0, 1, 1)", true,
+        num_batches, queries_per_batch, "INSERT INTO test2 VALUES ($0, 1, 1)", 50,
         num_batches * queries_per_batch);
   });
 
@@ -106,11 +106,11 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithFor
 
   std::thread t3([&]() -> void {
     PerformSingleAndMultiShardQueries(
-        num_batches, queries_per_batch, "UPDATE test2 SET test1_id=2 WHERE id = $0", false);
+        num_batches, queries_per_batch, "UPDATE test2 SET test1_id=2 WHERE id = $0", 30);
   });
   std::thread t4([&]() -> void {
     PerformSingleAndMultiShardQueries(
-        num_batches, queries_per_batch, "UPDATE test2 SET test1_id=2 WHERE id = $0", false,
+        num_batches, queries_per_batch, "UPDATE test2 SET test1_id=2 WHERE id = $0", 50,
         num_batches * queries_per_batch);
   });
 

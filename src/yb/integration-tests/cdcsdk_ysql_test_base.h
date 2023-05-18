@@ -3034,14 +3034,37 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
 
   void CheckRecordsConsistency(const std::vector<CDCSDKProtoRecordPB>& records) {
     uint64_t prev_commit_time = 0;
+    uint64_t prev_record_time = 0;
+    bool in_transaction = false;
+    bool first_record_in_transaction = false;
     for (auto& record : records) {
-      if (record.row_message().op() == RowMessage::INSERT ||
-          record.row_message().op() == RowMessage::UPDATE ||
-          record.row_message().op() == RowMessage::DELETE ||
-          record.row_message().op() == RowMessage::BEGIN ||
-          record.row_message().op() == RowMessage::COMMIT) {
+      if (record.row_message().op() == RowMessage::BEGIN) {
+        in_transaction = true;
+        first_record_in_transaction = true;
         ASSERT_TRUE(record.row_message().commit_time() >= prev_commit_time);
         prev_commit_time = record.row_message().commit_time();
+      }
+
+      if (record.row_message().op() == RowMessage::COMMIT) {
+        in_transaction = false;
+        ASSERT_TRUE(record.row_message().commit_time() >= prev_commit_time);
+        prev_commit_time = record.row_message().commit_time();
+      }
+
+      if (record.row_message().op() == RowMessage::INSERT ||
+          record.row_message().op() == RowMessage::UPDATE ||
+          record.row_message().op() == RowMessage::DELETE) {
+        ASSERT_TRUE(record.row_message().commit_time() >= prev_commit_time);
+        prev_commit_time = record.row_message().commit_time();
+
+        if (in_transaction) {
+          if (!first_record_in_transaction) {
+            ASSERT_TRUE(record.row_message().record_time() >= prev_record_time);
+          }
+
+          first_record_in_transaction = false;
+          prev_record_time = record.row_message().record_time();
+        }
       }
     }
   }
@@ -3084,21 +3107,13 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
   }
 
   void PerformSingleAndMultiShardInserts(
-      const int& num_batches, const int& inserts_per_batch, bool inject_latencies = false,
+      const int& num_batches, const int& inserts_per_batch, int apply_update_latency = 0,
       const int& start_index = 0) {
-    std::mt19937 rng;
-    Seed(&rng);
-    std::uniform_int_distribution<int> random_latency(0, 1000);
-
     for (int i = 0; i < num_batches; i++) {
       int multi_shard_inserts = inserts_per_batch / 2;
       int curr_start_id = start_index + i * inserts_per_batch;
 
-      if (inject_latencies)
-        FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = random_latency(rng);
-      else
-        FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = 0;
-
+      FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = apply_update_latency;
       ASSERT_OK(WriteRowsHelper(
           curr_start_id, curr_start_id + multi_shard_inserts, &test_cluster_, true));
 
@@ -3110,21 +3125,13 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
 
   void PerformSingleAndMultiShardQueries(
       const int& num_batches, const int& queries_per_batch, const string& query,
-      bool inject_latencies = false, const int& start_index = 0) {
-    std::mt19937 rng;
-    Seed(&rng);
-    std::uniform_int_distribution<int> random_latency(0, 100);
-
+      int apply_update_latency = 0, const int& start_index = 0) {
     auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(kNamespaceName));
     for (int i = 0; i < num_batches; i++) {
       int multi_shard_queries = queries_per_batch / 2;
       int curr_start_id = start_index + i * queries_per_batch;
 
-      if (inject_latencies)
-        FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = random_latency(rng);
-      else
-        FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = 0;
-
+      FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms = apply_update_latency;
       ASSERT_OK(conn.Execute("BEGIN"));
       for (int i = 0; i < multi_shard_queries; i++) {
         ASSERT_OK(conn.ExecuteFormat(query, curr_start_id + i + 1));
