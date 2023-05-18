@@ -145,5 +145,66 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithFor
   ASSERT_EQ(29281, get_changes_resp.records.size());
 }
 
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithAbortedTransactions)) {
+  FLAGS_cdc_max_stream_intent_records = 30;
+  FLAGS_enable_consistent_records = false;
+  ASSERT_OK(SetUpWithParams(3, 1, false));
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 1);
+
+  CDCStreamId stream_id = ASSERT_RESULT(CreateDBStream());
+  auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets, OpId::Min()));
+  ASSERT_FALSE(set_resp.has_error());
+
+  // COMMIT
+  ASSERT_OK(WriteRowsHelper(1, 10, &test_cluster_, true));
+
+  // ABORT
+  ASSERT_OK(WriteRowsHelper(10, 20, &test_cluster_, false));
+
+  // ABORT
+  ASSERT_OK(WriteRowsHelper(20, 30, &test_cluster_, false));
+
+  // COMMIT
+  ASSERT_OK(WriteRowsHelper(30, 40, &test_cluster_, true));
+
+  // ROLLBACK
+  auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(kNamespaceName));
+  ASSERT_OK(conn.Execute("BEGIN"));
+  for (int i = 0; i < 10; i++) {
+    ASSERT_OK(conn.ExecuteFormat("INSERT INTO test_table VALUES ($0, 1)", i + 40));
+  }
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+
+  // END
+  ASSERT_OK(conn.Execute("BEGIN"));
+  for (int i = 0; i < 10; i++) {
+    ASSERT_OK(conn.ExecuteFormat("INSERT INTO test_table VALUES ($0, 1)", i + 50));
+  }
+  ASSERT_OK(conn.Execute("END"));
+
+  // The count array stores counts of DDL, INSERT, UPDATE, DELETE, READ, TRUNCATE, BEGIN, COMMIT in
+  // that order.
+  const int expected_count[] = {
+      1, 29, 0, 0, 0, 0, 3, 3,
+  };
+  int count[] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+  auto get_changes_resp = GetAllPendingChangesFromCdc(stream_id, tablets);
+  for (auto record : get_changes_resp.records) {
+    UpdateRecordCount(record, count);
+  }
+
+  CheckRecordsConsistency(get_changes_resp.records);
+
+  LOG(INFO) << "Got " << get_changes_resp.records.size() << " records.";
+  for (int i = 0; i < 8; i++) {
+    ASSERT_EQ(expected_count[i], count[i]);
+  }
+  ASSERT_EQ(36, get_changes_resp.records.size());
+}
+
 }  // namespace cdc
 }  // namespace yb
