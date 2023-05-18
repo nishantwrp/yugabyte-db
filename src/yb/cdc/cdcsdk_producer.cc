@@ -1334,7 +1334,8 @@ void SortConsistentWALRecords(
 }
 
 Status GetConsistentWALRecords(
-    const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+    const std::shared_ptr<tablet::TabletPeer>& tablet_peer, const MemTrackerPtr& mem_tracker,
+    consensus::ReplicateMsgsHolder* msgs_holder, ScopedTrackedConsumption* consumption,
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* consistent_wal_records,
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* all_checkpoints,
     const uint64_t& consistent_safe_time, OpId* last_seen_op_id, int64_t** last_readable_opid_index,
@@ -1352,6 +1353,10 @@ Status GetConsistentWALRecords(
                         << "last_seen_op_id: " << last_seen_op_id << ", last_readable_opid_index "
                         << *last_readable_opid_index;
       break;
+    }
+
+    if (read_ops.read_from_disk_size && mem_tracker) {
+      (*consumption) = ScopedTrackedConsumption(mem_tracker, read_ops.read_from_disk_size);
     }
 
     for (const auto& msg : read_ops.messages) {
@@ -1388,6 +1393,11 @@ Status GetConsistentWALRecords(
         found_transaction_op = true;
         consistent_wal_records->push_back(msg);
       }
+    }
+
+    if (read_ops.messages.size() > 0) {
+      *msgs_holder = consensus::ReplicateMsgsHolder(
+          nullptr, std::move(read_ops.messages), std::move((*consumption)));
     }
   } while ((!stop_fetching_messages) &&
            ((*last_readable_opid_index) && last_seen_op_id->index < **last_readable_opid_index));
@@ -1581,8 +1591,9 @@ Status GetChangesForCDCSDK(
         all_checkpoints;
 
     RETURN_NOT_OK(GetConsistentWALRecords(
-        tablet_peer, &consistent_wal_records, &all_checkpoints, consistent_stream_safe_time,
-        &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline));
+        tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_wal_records,
+        &all_checkpoints, consistent_stream_safe_time, &last_seen_op_id, &last_readable_opid_index,
+        safe_hybrid_time, deadline));
     have_more_messages = HaveMoreMessages(true);
 
     if (consistent_wal_records.size() > 0 &&
@@ -1637,8 +1648,9 @@ Status GetChangesForCDCSDK(
           all_checkpoints;
 
       RETURN_NOT_OK(GetConsistentWALRecords(
-          tablet_peer, &consistent_wal_records, &all_checkpoints, consistent_stream_safe_time,
-          &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline));
+          tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_wal_records,
+          &all_checkpoints, consistent_stream_safe_time, &last_seen_op_id,
+          &last_readable_opid_index, safe_hybrid_time, deadline));
 
       if (consistent_wal_records.empty()) {
         VLOG_WITH_FUNC(1)
@@ -1648,11 +1660,6 @@ Status GetChangesForCDCSDK(
             << ", consistent_safe_time " << consistent_stream_safe_time;
         break;
       }
-
-      // TODO(nishantwrp): Fix this
-      // if (read_ops.read_from_disk_size && mem_tracker) {
-      //   consumption = ScopedTrackedConsumption(mem_tracker, read_ops.read_from_disk_size);
-      // }
 
       auto txn_participant = tablet_ptr->transaction_participant();
       if (txn_participant) {
@@ -1852,12 +1859,6 @@ Status GetChangesForCDCSDK(
           break;
         }
       }
-
-      // TODO(nishantwrp): Fix this
-      // if (read_ops.messages.size() > 0) {
-      //   *msgs_holder = consensus::ReplicateMsgsHolder(
-      //       nullptr, std::move(read_ops.messages), std::move(consumption));
-      // }
 
       if (!checkpoint_updated && VLOG_IS_ON(1)) {
         VLOG_WITH_FUNC(1)
