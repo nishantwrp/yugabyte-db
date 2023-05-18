@@ -8,6 +8,7 @@ import com.google.common.base.Strings;
 import com.yugabyte.yw.commissioner.Commissioner;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.CloudProviderDelete;
+import com.yugabyte.yw.commissioner.tasks.DestroyUniverse;
 import com.yugabyte.yw.commissioner.tasks.MultiTableBackup;
 import com.yugabyte.yw.commissioner.tasks.RebootNodeInUniverse;
 import com.yugabyte.yw.commissioner.tasks.params.IProviderTaskParams;
@@ -276,6 +277,7 @@ public class CustomerTaskController extends AuthenticatedController {
 
     AbstractTaskParams taskParams = null;
     switch (taskType) {
+      case CreateKubernetesUniverse:
       case CreateUniverse:
       case EditUniverse:
       case ReadOnlyClusterCreate:
@@ -283,6 +285,9 @@ public class CustomerTaskController extends AuthenticatedController {
         break;
       case ResizeNode:
         taskParams = Json.fromJson(oldTaskParams, ResizeNodeParams.class);
+        break;
+      case DestroyKubernetesUniverse:
+        taskParams = Json.fromJson(oldTaskParams, DestroyUniverse.Params.class);
         break;
       case AddNodeToUniverse:
       case RemoveNodeFromUniverse:
@@ -313,6 +318,12 @@ public class CustomerTaskController extends AuthenticatedController {
         nodeTaskParams.expectedUniverseVersion = -1;
         if (oldTaskParams.has("rootCA")) {
           nodeTaskParams.rootCA = UUID.fromString(oldTaskParams.get("rootCA").textValue());
+        }
+        if (universe.isYbcEnabled()) {
+          nodeTaskParams.setEnableYbc(true);
+          nodeTaskParams.setYbcInstalled(true);
+          nodeTaskParams.setYbcSoftwareVersion(
+              universe.getUniverseDetails().getYbcSoftwareVersion());
         }
         taskParams = nodeTaskParams;
         break;

@@ -69,18 +69,12 @@ public class AuditService {
           "$..gceApplicationCredentialsPath",
           "$..gceApplicationCredentials",
           // Azure client secret
-          "$..AZURE_CLIENT_ID",
           "$..AZURE_CLIENT_SECRET",
-          "$..AZURE_TENANT_ID",
-          "$..AZURE_SUBSCRIPTION_ID",
-          "$..AZURE_RG",
           "$..CLIENT_SECRET",
           "$..azuClientSecret",
           // Kubernetes secrets
           "$..KUBECONFIG_PULL_SECRET_CONTENT",
           "$..KUBECONFIG_CONTENT",
-          "$..kubernetesImagePullSecretName",
-          "$..kubernetesPullSecret",
           // onprem and certificate private keys
           "$..keyContent",
           "$..['customServerCertData.serverKeyContent']",

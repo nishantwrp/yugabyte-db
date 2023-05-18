@@ -13,6 +13,7 @@ import com.amazonaws.auth.BasicAWSCredentials;
 import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
 import com.amazonaws.services.ec2.AmazonEC2;
 import com.amazonaws.services.ec2.AmazonEC2ClientBuilder;
+import com.amazonaws.services.ec2.model.DeleteKeyPairRequest;
 import com.amazonaws.services.ec2.model.DescribeImagesRequest;
 import com.amazonaws.services.ec2.model.DescribeImagesResult;
 import com.amazonaws.services.ec2.model.DescribeInstanceTypeOfferingsRequest;
@@ -84,6 +85,7 @@ import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.helpers.NodeID;
 import com.yugabyte.yw.models.helpers.provider.AWSCloudInfo;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -730,13 +732,15 @@ public class AWSCloudImpl implements CloudAPI {
     }
   }
 
-  public SecurityGroup describeSecurityGroupsOrBadRequest(Provider provider, Region region) {
+  public List<SecurityGroup> describeSecurityGroupsOrBadRequest(Provider provider, Region region) {
     try {
       AmazonEC2 ec2Client = getEC2Client(provider, region.getCode());
       DescribeSecurityGroupsRequest request =
-          new DescribeSecurityGroupsRequest().withGroupIds(region.getSecurityGroupId());
+          new DescribeSecurityGroupsRequest()
+              .withGroupIds(
+                  Arrays.asList(region.getSecurityGroupId().replaceAll(",", "").split(" ")));
       DescribeSecurityGroupsResult result = ec2Client.describeSecurityGroups(request);
-      return result.getSecurityGroups().get(0);
+      return result.getSecurityGroups();
     } catch (AmazonServiceException e) {
       LOG.error("Security group details extraction failed: ", e);
       throw new PlatformServiceException(
@@ -779,5 +783,25 @@ public class AWSCloudImpl implements CloudAPI {
     AWSCloudInfo cloudInfo = provider.getDetails().getCloudInfo().getAws();
     return !StringUtils.isEmpty(cloudInfo.awsAccessKeyID)
         && !StringUtils.isEmpty(cloudInfo.awsAccessKeySecret);
+  }
+
+  public void deleteKeyPair(Provider provider, Region region, String keyPairName) {
+    List<Region> regions = new ArrayList<Region>();
+    regions.add(region);
+    if (regions.size() == 0) {
+      regions = provider.getRegions();
+    }
+
+    try {
+      for (Region r : regions) {
+        AmazonEC2 ec2Client = getEC2Client(provider, r.getCode());
+        DeleteKeyPairRequest request = new DeleteKeyPairRequest().withKeyName(keyPairName);
+        ec2Client.deleteKeyPair(request);
+      }
+    } catch (AmazonServiceException e) {
+      LOG.error("Access Key deletion failed: ", e);
+      throw new PlatformServiceException(
+          BAD_REQUEST, "Access Key deletion failed: " + e.getMessage());
+    }
   }
 }

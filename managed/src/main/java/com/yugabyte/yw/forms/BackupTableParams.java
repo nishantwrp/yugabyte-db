@@ -13,9 +13,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import lombok.NoArgsConstructor;
+import lombok.ToString;
 import org.apache.commons.collections.CollectionUtils;
 import org.yb.CommonTypes.TableType;
 import play.data.validation.Constraints;
@@ -165,6 +168,37 @@ public class BackupTableParams extends TableManagerParams {
   @ApiModelProperty(hidden = true)
   public long thisBackupSubTaskStartTime = 0L;
 
+  @ApiModelProperty(hidden = true)
+  public final Map<UUID, ParallelBackupState> backupDBStates = new ConcurrentHashMap<>();
+
+  @ToString
+  public static class ParallelBackupState {
+    public String nodeIp;
+    public String currentYbcTaskId;
+    public boolean alreadyScheduled = false;
+
+    public void resetOnComplete() {
+      this.nodeIp = null;
+      this.currentYbcTaskId = null;
+      this.alreadyScheduled = true;
+    }
+
+    public void setIntermediate(String nodeIp, String currentYbcTaskId) {
+      this.nodeIp = nodeIp;
+      this.currentYbcTaskId = currentYbcTaskId;
+    }
+  }
+
+  @JsonIgnore
+  public void initializeBackupDBStates() {
+    this.backupList
+        .parallelStream()
+        .forEach(
+            paramsEntry ->
+                this.backupDBStates.put(
+                    paramsEntry.backupParamsIdentifier, new ParallelBackupState()));
+  }
+
   @JsonIgnore
   public BackupTableParams(BackupRequestParams backupRequestParams) {
     this.customerUuid = backupRequestParams.customerUUID;
@@ -214,6 +248,7 @@ public class BackupTableParams extends TableManagerParams {
     this.expiryTimeUnit = tableParams.expiryTimeUnit;
     this.backupType = tableParams.backupType;
     this.isFullBackup = tableParams.isFullBackup;
+    this.allTables = tableParams.allTables;
     this.scheduleUUID = tableParams.scheduleUUID;
     this.scheduleName = tableParams.scheduleName;
     this.disableChecksum = tableParams.disableChecksum;

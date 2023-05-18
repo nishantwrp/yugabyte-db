@@ -19,6 +19,7 @@ import (
 	"github.com/yugabyte/yugabyte-db/managed/yba-installer/common/shell"
 	"github.com/yugabyte/yugabyte-db/managed/yba-installer/config"
 	log "github.com/yugabyte/yugabyte-db/managed/yba-installer/logging"
+	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/runner"
 	"github.com/yugabyte/yugabyte-db/managed/yba-installer/systemd"
 )
 
@@ -48,14 +49,19 @@ type Prometheus struct {
 	name    string
 	version string
 	prometheusDirectories
+	runStep
 }
 
 // NewPrometheus creates a new prometheus service struct.
-func NewPrometheus(version string) Prometheus {
+func NewPrometheus(version string, run runStep) Prometheus {
+	if run == nil {
+		run = runner.New("prometheus")
+	}
 	return Prometheus{
 		name:                  "prometheus",
 		version:               version,
 		prometheusDirectories: newPrometheusDirectories(),
+		runStep:               run,
 	}
 }
 
@@ -80,21 +86,43 @@ func (prom Prometheus) Name() string {
 // Install the prometheus service.
 func (prom Prometheus) Install() error {
 	log.Info("Starting Prometheus install")
-	config.GenerateTemplate(prom)
-	prom.moveAndExtractPrometheusPackage()
-	prom.createDataDirs()
-	prom.createPrometheusSymlinks()
+	prom.StartSection("prometheus install")
+	defer prom.EndSection()
+
+	prom.RunStep(func() error {
+		config.GenerateTemplate(prom)
+		return nil
+	})
+
+	if err := prom.RunStep(prom.moveAndExtractPrometheusPackage); err != nil {
+		return err
+	}
+	if err := prom.RunStep(prom.createDataDirs); err != nil {
+		return err
+	}
+	if err := prom.RunStep(prom.createPrometheusSymlinks); err != nil {
+		return err
+	}
 
 	//chown is not needed when we are operating under non-root, the user will already
 	//have the necessary access.
 	if common.HasSudoAccess() {
 		userName := viper.GetString("service_username")
-		common.Chown(common.GetSoftwareRoot()+"/prometheus", userName, userName, true)
+		promDir := common.GetSoftwareRoot() + "/prometheus"
+		chownClosure := func() error {
+			return common.Chown(promDir, userName, userName, true)
+		}
+		if err := prom.RunStep(chownClosure); err != nil {
+			log.Error("failed to change ownership of " + promDir + ": " + err.Error())
+			return err
+		}
 	} else {
-		prom.CreateCronJob()
+		if err := prom.RunStep(prom.CreateCronJob); err != nil {
+			return err
+		}
 	}
 
-	if err := prom.Start(); err != nil {
+	if err := prom.RunStep(prom.Start); err != nil {
 		return err
 	}
 	log.Info("Finishing Prometheus install")
@@ -236,8 +264,9 @@ func (prom Prometheus) Upgrade() error {
 	prom.prometheusDirectories = newPrometheusDirectories()
 	config.GenerateTemplate(prom) // No need to reload systemd, start takes care of that for us.
 	prom.moveAndExtractPrometheusPackage()
-	prom.createPrometheusSymlinks()
-
+	if err := prom.createPrometheusSymlinks(); err != nil {
+		return err
+	}
 	//chown is not needed when we are operating under non-root, the user will already
 	//have the necessary access.
 	if common.HasSudoAccess() {
@@ -252,7 +281,7 @@ func (prom Prometheus) Upgrade() error {
 	return prom.Start()
 }
 
-func (prom Prometheus) moveAndExtractPrometheusPackage() {
+func (prom Prometheus) moveAndExtractPrometheusPackage() error {
 
 	srcPath := fmt.Sprintf(
 		"%s/third-party/prometheus-%s.linux-amd64.tar.gz", common.GetInstallerSoftwareDir(),
@@ -263,7 +292,7 @@ func (prom Prometheus) moveAndExtractPrometheusPackage() {
 	common.CopyFile(srcPath, dstPath)
 	rExtract, errExtract := os.Open(dstPath)
 	if errExtract != nil {
-		log.Fatal("Error in starting the File Extraction process.")
+		log.Fatal("Error in starting the File Extraction process. " + errExtract.Error())
 	}
 	defer rExtract.Close()
 
@@ -278,10 +307,10 @@ func (prom Prometheus) moveAndExtractPrometheusPackage() {
 		}
 		log.Debug(dstPath + " successfully extracted.")
 	}
-
+	return nil
 }
 
-func (prom Prometheus) createDataDirs() {
+func (prom Prometheus) createDataDirs() error {
 
 	common.MkdirAll(prom.DataDir+"/storage", os.ModePerm)
 	common.MkdirAll(prom.DataDir+"/swamper_targets", os.ModePerm)
@@ -289,16 +318,23 @@ func (prom Prometheus) createDataDirs() {
 	log.Debug(prom.DataDir + "/storage /swamper_targets /swamper_rules" + " directories created.")
 
 	// Create the log file
-	common.Create(prom.DataDir + "/prometheus.log")
+	if _, err := common.Create(prom.DataDir + "/prometheus.log"); err != nil {
+		log.Error("Failed to create prometheus log file: " + err.Error())
+		return err
+	}
 
 	if common.HasSudoAccess() {
 		// Need to give the yugabyte user ownership of the entire postgres directory.
 		userName := viper.GetString("service_username")
-		common.Chown(prom.DataDir, userName, userName, true)
+		if err := common.Chown(prom.DataDir, userName, userName, true); err != nil {
+			log.Error("failed to change ownership of " + prom.DataDir + ": " + err.Error())
+			return err
+		}
 	}
+	return nil
 }
 
-func (prom Prometheus) createPrometheusSymlinks() {
+func (prom Prometheus) createPrometheusSymlinks() error {
 
 	// Version specific promtheus that we untarred to packages.
 	promPkg := fmt.Sprintf("%s/packages/prometheus-%s.linux-amd64",
@@ -311,19 +347,35 @@ func (prom Prometheus) createPrometheusSymlinks() {
 		promBinaryDir = "/usr/local/bin"
 	} else {
 		// promBinaryDir doesn't exist for non-root mode, lets create it.
-		common.MkdirAll(promBinaryDir, os.ModePerm)
+		if err := common.MkdirAll(promBinaryDir, os.ModePerm); err != nil {
+			log.Error("failed to create " + promBinaryDir + ": " + err.Error())
+			return err
+		}
 	}
 
-	common.CreateSymlink(promPkg, promBinaryDir, "prometheus")
-	common.CreateSymlink(promPkg, promBinaryDir, "promtool")
-	common.CreateSymlink(promPkg, prom.PromDir, "consoles")
-	common.CreateSymlink(promPkg, prom.PromDir, "console_libraries")
+	links := []struct {
+		pkgDir, linkDir, binary string
+	}{
+		{promPkg, promBinaryDir, "prometheus"},
+		{promPkg, promBinaryDir, "promtool"},
+		{promPkg, prom.PromDir, "consoles"},
+		{promPkg, prom.PromDir, "console_libraries"},
+	}
+	for _, link := range links {
+		if err := common.CreateSymlink(link.pkgDir, link.linkDir, link.binary); err != nil {
+			log.Error("failed to create symlink for " + link.binary + ": " + err.Error())
+			return err
+		}
+	}
 
 	if common.HasSudoAccess() {
 		userName := viper.GetString("service_username")
-		common.Chown(prom.PromDir, userName, userName, true)
+		if err := common.Chown(prom.PromDir, userName, userName, true); err != nil {
+			log.Error("failed to change ownership of " + prom.PromDir + ": " + err.Error())
+			return err
+		}
 	}
-
+	return nil
 }
 
 // Status prints out the header information for the
@@ -371,7 +423,7 @@ func (prom Prometheus) Status() (common.Status, error) {
 }
 
 // CreateCronJob creates the cron job for managing prometheus with cron script in non-root.
-func (prom Prometheus) CreateCronJob() {
+func (prom Prometheus) CreateCronJob() error {
 	bashCmd := fmt.Sprintf(
 		"(crontab -l 2>/dev/null; echo \"@reboot %s %s %s %s %s %s %s %s %s \") | sort - | uniq - | "+
 			"crontab - ",
@@ -386,4 +438,5 @@ func (prom Prometheus) CreateCronJob() {
 		prom.version,
 	)
 	shell.Run("bash", "-c", bashCmd)
+	return nil
 }
