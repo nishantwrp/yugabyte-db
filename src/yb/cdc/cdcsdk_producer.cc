@@ -1378,11 +1378,16 @@ Status GetConsistentWALRecords(
           continue;
         }
 
+        VLOG_WITH_FUNC(1) << "Received a non_transaction_op after receiving atleast one transaction"
+                          << " op. Ending the segment here. " << msg->ShortDebugString();
         stop_fetching_messages = true;
         break;
       }
 
       if (GetTransactionCommitTime(msg) > consistent_safe_time) {
+        VLOG_WITH_FUNC(1) << "Received a message with commit_time > consistent_safe_time."
+                             " Ending the segment here. consistent_safe_time: "
+                          << consistent_safe_time << " msg: " << msg->ShortDebugString();
         stop_fetching_messages = true;
         break;
       }
@@ -1404,6 +1409,9 @@ Status GetConsistentWALRecords(
            ((*last_readable_opid_index) && last_seen_op_id->index < **last_readable_opid_index));
 
   SortConsistentWALRecords(consistent_wal_records, non_transaction_ops);
+  VLOG_WITH_FUNC(1) << "Got a total of " << consistent_wal_records->size() << " WAL records in the"
+                    << "records in the current segment with non_transaction_ops: "
+                    << non_transaction_ops;
   return Status::OK();
 }
 
@@ -1507,7 +1515,8 @@ Status GetChangesForCDCSDK(
     const TableId& colocated_table_id,
     const CoarseTimePoint deadline) {
   OpId op_id{from_op_id.term(), from_op_id.index()};
-  VLOG(1) << "The from_op_id from GetChanges is  " << op_id << " for tablet_id: " << tablet_id;
+  VLOG(1) << "GetChanges request has from_op_id: " << op_id
+          << ", safe_hybrid_time: " << safe_hybrid_time << " for tablet_id: " << tablet_id;
   ScopedTrackedConsumption consumption;
   CDCSDKCheckpointPB checkpoint;
   bool checkpoint_updated = false;
@@ -1668,6 +1677,10 @@ Status GetChangesForCDCSDK(
                  << " with stream_id: " << stream_id
                  << " because there is no RAFT log message read from WAL with from_op_id: "
                  << OpId::FromPB(from_op_id) << ", which can impact the safe time.";
+      if (consistent_wal_records.size() > 0) {
+        VLOG(1) << "Expected message with UPDATE_TRANSACTION_OP but instead received a message"
+                << "with op: " << consistent_wal_records[0]->op_type();
+      }
     }
 
     RETURN_NOT_OK(reverse_index_key_slice.consume_byte(dockv::KeyEntryTypeAsChar::kTransactionId));
@@ -1964,6 +1977,7 @@ Status GetChangesForCDCSDK(
   auto safe_time = GetCDCSDKSafeTimeForTarget(
       leader_safe_time.get(), ht_of_last_returned_message, have_more_messages);
   resp->set_safe_hybrid_time(safe_time.ToUint64());
+  VLOG(1) << "The safe_hybrid_time is response is set to " << resp->safe_hybrid_time();
 
   if (checkpoint_updated && !(checkpoint.has_term() && checkpoint.has_index())) {
     checkpoint.set_term(from_op_id.term());
