@@ -319,9 +319,16 @@ Result<size_t> PopulatePackedRows(
 }
 
 HybridTime GetCDCSDKSafeTimeForTarget(
-    const HybridTime leader_safe_time,
-    HybridTime ht_of_last_returned_message,
-    HaveMoreMessages have_more_messages) {
+    const HybridTime leader_safe_time, HybridTime ht_of_last_returned_message,
+    HaveMoreMessages have_more_messages, const uint64_t& consistent_stream_safe_time) {
+  if (FLAGS_enable_consistent_records) {
+    if (ht_of_last_returned_message.is_valid()) {
+      return ht_of_last_returned_message;
+    }
+
+    return HybridTime(consistent_stream_safe_time);
+  }
+
   if (have_more_messages) {
     return ht_of_last_returned_message;
   }
@@ -1975,9 +1982,10 @@ Status GetChangesForCDCSDK(
   }
 
   auto safe_time = GetCDCSDKSafeTimeForTarget(
-      leader_safe_time.get(), ht_of_last_returned_message, have_more_messages);
+      leader_safe_time.get(), ht_of_last_returned_message, have_more_messages,
+      consistent_stream_safe_time);
   resp->set_safe_hybrid_time(safe_time.ToUint64());
-  VLOG(1) << "The safe_hybrid_time is response is set to " << resp->safe_hybrid_time();
+  VLOG(1) << "The safe_hybrid_time in response is set to " << resp->safe_hybrid_time();
 
   if (checkpoint_updated && !(checkpoint.has_term() && checkpoint.has_index())) {
     checkpoint.set_term(from_op_id.term());
