@@ -338,7 +338,7 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithDDL
         inserts_per_batch,
         "INSERT INTO test_table VALUES ($0, 1)",
         20,
-        (2 * num_batches * inserts_per_batch) + 150);
+        (2 * num_batches * inserts_per_batch));
   });
   std::thread t4([&]() -> void {
     PerformSingleAndMultiShardQueries(
@@ -346,7 +346,7 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithDDL
         inserts_per_batch,
         "INSERT INTO test_table VALUES ($0, 1)",
         50,
-        (3 * num_batches * inserts_per_batch) + 150);
+        (3 * num_batches * inserts_per_batch));
   });
 
   t3.join();
@@ -376,6 +376,182 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithDDL
     ASSERT_EQ(expected_count[i], count[i]);
   }
   ASSERT_EQ(30603, get_changes_resp.records.size());
+}
+
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithLeadershipChange)) {
+  FLAGS_enable_load_balancing = false;
+
+  ASSERT_OK(SetUpWithParams(3, 1, false));
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 1);
+  CDCStreamId stream_id = ASSERT_RESULT(CreateDBStream());
+  auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets, OpId::Min()));
+  ASSERT_FALSE(set_resp.has_error());
+
+  int num_batches = 75;
+  int inserts_per_batch = 100;
+
+  std::thread t1(
+      [&]() -> void { PerformSingleAndMultiShardInserts(num_batches, inserts_per_batch, 20); });
+  std::thread t2([&]() -> void {
+    PerformSingleAndMultiShardInserts(
+        num_batches, inserts_per_batch, 50, num_batches * inserts_per_batch);
+  });
+
+  t1.join();
+  t2.join();
+
+  auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(kNamespaceName));
+  ASSERT_OK(conn.Execute("ALTER TABLE test_table ADD value_2 int;"));
+  ASSERT_OK(conn.Execute("ALTER TABLE test_table DROP value_1;"));
+
+  std::thread t3([&]() -> void {
+    PerformSingleAndMultiShardQueries(
+        num_batches,
+        inserts_per_batch,
+        "INSERT INTO test_table VALUES ($0, 1)",
+        20,
+        (2 * num_batches * inserts_per_batch));
+  });
+  std::thread t4([&]() -> void {
+    PerformSingleAndMultiShardQueries(
+        num_batches,
+        inserts_per_batch,
+        "INSERT INTO test_table VALUES ($0, 1)",
+        50,
+        (3 * num_batches * inserts_per_batch));
+  });
+
+  t3.join();
+  t4.join();
+
+  ASSERT_OK(test_client()->FlushTables({table.table_id()}, false, 1000, false));
+
+  // Wait for all transactions to be applied.
+  SleepFor(MonoDelta::FromSeconds(5));
+
+  // The count array stores counts of DDL, INSERT, UPDATE, DELETE, READ, TRUNCATE, BEGIN, COMMIT in
+  // that order.
+  const int expected_count[] = {
+      3, 4 * num_batches * inserts_per_batch, 0, 0, 0, 0, 4 * num_batches, 4 * num_batches,
+  };
+  int count[] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+  size_t first_leader_index = 0;
+  size_t first_follower_index = 0;
+  GetTabletLeaderAndAnyFollowerIndex(tablets, &first_leader_index, &first_follower_index);
+
+  auto get_changes_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
+  vector<CDCSDKProtoRecordPB> all_records;
+  for (int32_t i = 0; i < get_changes_resp.cdc_sdk_proto_records_size(); i++) {
+    auto record = get_changes_resp.cdc_sdk_proto_records(i);
+    all_records.push_back(record);
+    UpdateRecordCount(record, count);
+  }
+
+  // Leadership Change.
+  ASSERT_OK(ChangeLeaderOfTablet(first_follower_index, tablets[0].tablet_id()));
+
+  auto all_pending_changes = GetAllPendingChangesFromCdc(
+      stream_id,
+      tablets,
+      &get_changes_resp.cdc_sdk_checkpoint(),
+      0,
+      get_changes_resp.safe_hybrid_time());
+  for (size_t i = 0; i < all_pending_changes.records.size(); i++) {
+    auto record = all_pending_changes.records[i];
+    all_records.push_back(record);
+    UpdateRecordCount(record, count);
+  }
+
+  CheckRecordsConsistency(all_records);
+  LOG(INFO) << "Got " << all_records.size() << " records.";
+  for (int i = 0; i < 8; i++) {
+    ASSERT_EQ(expected_count[i], count[i]);
+  }
+  ASSERT_EQ(30603, all_records.size());
+}
+
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithColocation)) {
+  ASSERT_OK(SetUpWithParams(3, 1, false));
+
+  auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(kNamespaceName));
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLEGROUP tg1"));
+  ASSERT_OK(
+      conn.ExecuteFormat("CREATE TABLE test1(id int primary key, value_1 int) TABLEGROUP tg1;"));
+  ASSERT_OK(
+      conn.ExecuteFormat("CREATE TABLE test2(id int primary key, value_1 int) TABLEGROUP tg1;"));
+
+  auto table1 = ASSERT_RESULT(GetTable(&test_cluster_, kNamespaceName, "test1"));
+  auto table2 = ASSERT_RESULT(GetTable(&test_cluster_, kNamespaceName, "test2"));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table1, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 1);
+
+  CDCStreamId stream_id = ASSERT_RESULT(CreateDBStream());
+  auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets, OpId::Min()));
+  ASSERT_FALSE(set_resp.has_error());
+
+  int num_batches = 50;
+  int inserts_per_batch = 50;
+
+  std::thread t1([&]() -> void {
+    PerformSingleAndMultiShardQueries(
+        num_batches, inserts_per_batch, "INSERT INTO test1 VALUES ($0, 1)", 20);
+  });
+  std::thread t2([&]() -> void {
+    PerformSingleAndMultiShardQueries(
+        num_batches,
+        inserts_per_batch,
+        "INSERT INTO test1 VALUES ($0, 1)",
+        50,
+        num_batches * inserts_per_batch);
+  });
+  std::thread t3([&]() -> void {
+    PerformSingleAndMultiShardQueries(
+        num_batches, inserts_per_batch, "INSERT INTO test2 VALUES ($0, 1)", 20);
+  });
+  std::thread t4([&]() -> void {
+    PerformSingleAndMultiShardQueries(
+        num_batches,
+        inserts_per_batch,
+        "INSERT INTO test2 VALUES ($0, 1)",
+        50,
+        num_batches * inserts_per_batch);
+  });
+
+  t1.join();
+  t2.join();
+  t3.join();
+  t4.join();
+
+  ASSERT_OK(test_client()->FlushTables({table1.table_id()}, false, 1000, false));
+  ASSERT_OK(test_client()->FlushTables({table2.table_id()}, false, 1000, false));
+
+  // Wait for all transactions to be applied.
+  SleepFor(MonoDelta::FromSeconds(5));
+
+  // The count array stores counts of DDL, INSERT, UPDATE, DELETE, READ, TRUNCATE, BEGIN, COMMIT in
+  // that order.
+  const int expected_count[] = {
+      2, 4 * num_batches * inserts_per_batch, 0, 0, 0, 0, 8 * num_batches, 8 * num_batches,
+  };
+  int count[] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+  auto get_changes_resp = GetAllPendingChangesFromCdc(stream_id, tablets);
+  for (size_t i = 0; i < get_changes_resp.records.size(); i++) {
+    auto record = get_changes_resp.records[i];
+    UpdateRecordCount(record, count);
+  }
+
+  CheckRecordsConsistency(get_changes_resp.records);
+  LOG(INFO) << "Got " << get_changes_resp.records.size() << " records.";
+  for (int i = 0; i < 8; i++) {
+    ASSERT_EQ(expected_count[i], count[i]);
+  }
+  ASSERT_EQ(10802, get_changes_resp.records.size());
 }
 
 }  // namespace cdc
