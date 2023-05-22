@@ -121,7 +121,7 @@ DECLARE_bool(cdc_populate_safepoint_record);
 DECLARE_string(vmodule);
 DECLARE_int32(ysql_num_shards_per_tserver);
 DECLARE_int32(TEST_txn_participant_inject_latency_on_apply_update_txn_ms);
-DECLARE_bool(enable_consistent_records);
+DECLARE_bool(cdc_enable_consistent_records);
 
 namespace yb {
 

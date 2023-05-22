@@ -55,7 +55,7 @@ DEFINE_RUNTIME_bool(
     "If 'true' we will also send a 'SAFEPOINT' record at the end of each GetChanges call.");
 
 DEFINE_NON_RUNTIME_bool(
-    enable_consistent_records, true,
+    cdc_enable_consistent_records, true,
     "If 'true' we will ensure that the records are order by the commit_time.");
 
 DEFINE_test_flag(
@@ -321,7 +321,7 @@ Result<size_t> PopulatePackedRows(
 HybridTime GetCDCSDKSafeTimeForTarget(
     const HybridTime leader_safe_time, HybridTime ht_of_last_returned_message,
     HaveMoreMessages have_more_messages, const uint64_t& consistent_stream_safe_time) {
-  if (FLAGS_enable_consistent_records) {
+  if (FLAGS_cdc_enable_consistent_records) {
     if (ht_of_last_returned_message.is_valid()) {
       return ht_of_last_returned_message;
     }
@@ -1477,7 +1477,7 @@ bool CanUpdateCheckpointOpId(
     const uint64_t& commit_time) {
   bool update_checkpoint = false;
 
-  if (!FLAGS_enable_consistent_records) {
+  if (!FLAGS_cdc_enable_consistent_records) {
     (*next_checkpoint_index)++;
     return true;
   }
@@ -1662,7 +1662,7 @@ Status GetChangesForCDCSDK(
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>> consistent_wal_records,
         all_checkpoints;
 
-    if (FLAGS_enable_consistent_records)
+    if (FLAGS_cdc_enable_consistent_records)
       RETURN_NOT_OK(GetConsistentWALRecords(
           tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_wal_records,
           &all_checkpoints, consistent_stream_safe_time, &last_seen_op_id,
@@ -1729,7 +1729,7 @@ Status GetChangesForCDCSDK(
       std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>> consistent_wal_records,
           all_checkpoints;
 
-      if (FLAGS_enable_consistent_records)
+      if (FLAGS_cdc_enable_consistent_records)
         RETURN_NOT_OK(GetConsistentWALRecords(
             tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_wal_records,
             &all_checkpoints, consistent_stream_safe_time, &last_seen_op_id,
