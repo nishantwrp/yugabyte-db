@@ -554,5 +554,104 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithCol
   ASSERT_EQ(10802, get_changes_resp.records.size());
 }
 
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithTabletSplit)) {
+  FLAGS_update_min_cdc_indices_interval_secs = 1;
+  FLAGS_cdc_state_checkpoint_update_interval_ms = 0;
+  FLAGS_aborted_intent_cleanup_ms = 1000;
+  FLAGS_cdc_parent_tablet_deletion_task_retry_secs = 1;
+
+  ASSERT_OK(SetUpWithParams(3, 1, false));
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName));
+  TableId table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 1);
+  CDCStreamId stream_id = ASSERT_RESULT(CreateDBStream(IMPLICIT));
+  auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets, OpId::Min()));
+  ASSERT_FALSE(set_resp.has_error());
+
+  int num_batches = 75;
+  int inserts_per_batch = 100;
+
+  std::thread t1(
+      [&]() -> void { PerformSingleAndMultiShardInserts(num_batches, inserts_per_batch, 20); });
+  std::thread t2([&]() -> void {
+    PerformSingleAndMultiShardInserts(
+        num_batches, inserts_per_batch, 50, num_batches * inserts_per_batch);
+  });
+
+  t1.join();
+  t2.join();
+
+  ASSERT_OK(test_client()->FlushTables({table.table_id()}, false, 1000, true));
+  ASSERT_OK(test_cluster_.mini_cluster_->CompactTablets());
+  WaitUntilSplitIsSuccesful(tablets.Get(0).tablet_id(), table);
+
+  std::thread t3([&]() -> void {
+    PerformSingleAndMultiShardInserts(
+        num_batches, inserts_per_batch, 20, (2 * num_batches * inserts_per_batch));
+  });
+  std::thread t4([&]() -> void {
+    PerformSingleAndMultiShardInserts(
+        num_batches, inserts_per_batch, 50, (3 * num_batches * inserts_per_batch));
+  });
+
+  t3.join();
+  t4.join();
+
+  ASSERT_OK(test_client()->FlushTables({table.table_id()}, false, 1000, true));
+  ASSERT_OK(test_cluster_.mini_cluster_->CompactTablets());
+
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets_after_first_split;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets_after_first_split, nullptr));
+  ASSERT_EQ(tablets_after_first_split.size(), 2);
+
+  // The count array stores counts of DDL, INSERT, UPDATE, DELETE, READ, TRUNCATE, BEGIN, COMMIT in
+  // that order.
+  const int expected_count_1[] = {
+      1, 2 * num_batches * inserts_per_batch, 0, 0, 0, 0, 2 * num_batches, 2 * num_batches,
+  };
+  const int expected_count_2[] = {3, 4 * num_batches * inserts_per_batch, 0, 0, 0, 0};
+  int count[] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+  auto parent_get_changes = GetAllPendingChangesFromCdc(stream_id, tablets);
+  for (size_t i = 0; i < parent_get_changes.records.size(); i++) {
+    auto record = parent_get_changes.records[i];
+    UpdateRecordCount(record, count);
+  }
+
+  CheckRecordsConsistency(parent_get_changes.records);
+  for (int i = 0; i < 8; i++) {
+    ASSERT_EQ(expected_count_1[i], count[i]);
+  }
+
+  // Wait until the 'cdc_parent_tablet_deletion_task_' has run.
+  SleepFor(MonoDelta::FromSeconds(2));
+
+  auto get_tablets_resp =
+      ASSERT_RESULT(GetTabletListToPollForCDC(stream_id, table_id, tablets[0].tablet_id()));
+  for (const auto& tablet_checkpoint_pair : get_tablets_resp.tablet_checkpoint_pairs()) {
+    auto new_tablet = tablet_checkpoint_pair.tablet_locations();
+    auto new_checkpoint = tablet_checkpoint_pair.cdc_sdk_checkpoint();
+
+    google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+    auto tablet_ptr = tablets.Add();
+    tablet_ptr->CopyFrom(new_tablet);
+
+    auto child_get_changes = GetAllPendingChangesFromCdc(stream_id, tablets, &new_checkpoint);
+    vector<CDCSDKProtoRecordPB> child_plus_parent = parent_get_changes.records;
+    for (size_t i = 0; i < child_get_changes.records.size(); i++) {
+      auto record = child_get_changes.records[i];
+      child_plus_parent.push_back(record);
+      UpdateRecordCount(record, count);
+    }
+    CheckRecordsConsistency(child_plus_parent);
+  }
+
+  for (int i = 0; i < 6; i++) {
+    ASSERT_EQ(expected_count_2[i], count[i]);
+  }
+}
+
 }  // namespace cdc
 }  // namespace yb
