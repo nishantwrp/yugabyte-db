@@ -1325,16 +1325,17 @@ bool IsUpdateTransactionOp(const std::shared_ptr<yb::consensus::LWReplicateMsg>&
   return msg->op_type() == consensus::OperationType::UPDATE_TRANSACTION_OP;
 }
 
+// Returns the transaction commit time in case of a multi shard transaction, else returns the
+// message hybrid time.
 uint64_t GetTransactionCommitTime(const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg) {
   return IsUpdateTransactionOp(msg) ? msg->transaction_state().commit_hybrid_time()
                                     : msg->hybrid_time();
 }
 
 void SortConsistentWALRecords(
-    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* consistent_wal_records,
-    const int& non_transaction_ops) {
+    std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* consistent_wal_records) {
   std::sort(
-      (*consistent_wal_records).begin() + non_transaction_ops, (*consistent_wal_records).end(),
+      (*consistent_wal_records).begin(), (*consistent_wal_records).end(),
       [](const std::shared_ptr<yb::consensus::LWReplicateMsg>& lhs,
          const std::shared_ptr<yb::consensus::LWReplicateMsg>& rhs) -> bool {
         return GetTransactionCommitTime(lhs) < GetTransactionCommitTime(rhs);
@@ -1349,8 +1350,6 @@ Status GetConsistentWALRecords(
     const uint64_t& consistent_safe_time, const OpId& historical_max_op_id,
     bool* wait_for_wal_update, OpId* last_seen_op_id, int64_t** last_readable_opid_index,
     const int64_t& safe_hybrid_time, const CoarseTimePoint& deadline) {
-  int non_transaction_ops = 0;
-  bool found_transaction_op = false;
   bool stop_fetching_messages = false;
   do {
     consensus::ReadOpsResult read_ops;
@@ -1376,22 +1375,6 @@ Status GetConsistentWALRecords(
         continue;
       }
 
-      if (!IsWriteOp(msg) && !IsUpdateTransactionOp(msg)) {
-        if (!found_transaction_op) {
-          last_seen_op_id->term = msg->id().term();
-          last_seen_op_id->index = msg->id().index();
-
-          non_transaction_ops++;
-          consistent_wal_records->push_back(msg);
-          continue;
-        }
-
-        VLOG_WITH_FUNC(1) << "Received a non_transaction_op after receiving atleast one transaction"
-                          << " op. Ending the segment here. " << msg->ShortDebugString();
-        stop_fetching_messages = true;
-        break;
-      }
-
       if (GetTransactionCommitTime(msg) > consistent_safe_time) {
         VLOG_WITH_FUNC(1) << "Received a message with commit_time > consistent_safe_time."
                              " Ending the segment here. consistent_safe_time: "
@@ -1404,7 +1387,6 @@ Status GetConsistentWALRecords(
       last_seen_op_id->index = msg->id().index();
       all_checkpoints->push_back(msg);
       if ((int64_t)GetTransactionCommitTime(msg) > safe_hybrid_time) {
-        found_transaction_op = true;
         consistent_wal_records->push_back(msg);
       }
     }
@@ -1422,10 +1404,9 @@ Status GetConsistentWALRecords(
     (*wait_for_wal_update) = true;
   }
 
-  SortConsistentWALRecords(consistent_wal_records, non_transaction_ops);
+  SortConsistentWALRecords(consistent_wal_records);
   VLOG_WITH_FUNC(1) << "Got a total of " << consistent_wal_records->size() << " WAL records in the"
-                    << "records in the current segment with non_transaction_ops: "
-                    << non_transaction_ops;
+                    << "records in the current segment";
   return Status::OK();
 }
 
@@ -1455,19 +1436,19 @@ Status GetWALRecords(
     last_seen_op_id->term = msg->id().term();
     last_seen_op_id->index = msg->id().index();
 
-    if (skip_intents &&
-        (IsIntent(msg) || (IsUpdateTransactionOp(msg) &&
-                           msg->transaction_state().status() != TransactionStatus::APPLYING))) {
+    bool is_intent_or_invalid_transaction_op =
+        IsIntent(msg) || (IsUpdateTransactionOp(msg) &&
+                          msg->transaction_state().status() != TransactionStatus::APPLYING);
+
+    if (skip_intents && is_intent_or_invalid_transaction_op) {
       continue;
     }
 
-    consistent_wal_records->push_back(msg);
-
-    if ((IsWriteOp(msg) && !IsIntent(msg)) ||
-        (IsUpdateTransactionOp(msg) &&
-         msg->transaction_state().status() == TransactionStatus::APPLYING)) {
+    if (!is_intent_or_invalid_transaction_op) {
       all_checkpoints->push_back(msg);
     }
+
+    consistent_wal_records->push_back(msg);
   }
 
   if (read_ops.messages.size() > 0) {
@@ -1749,6 +1730,8 @@ Status GetChangesForCDCSDK(
             &wait_for_wal_update, &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time,
             deadline));
       else
+        // 'skip_intents' is false otherwise in case the complete wal segment is filled with
+        // intents we will break the loop thinking that WAL has no more records.
         RETURN_NOT_OK(GetWALRecords(
             tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_wal_records,
             &all_checkpoints, consistent_stream_safe_time, &last_seen_op_id,
@@ -1893,9 +1876,15 @@ Status GetChangesForCDCSDK(
                   msg, resp->add_cdc_sdk_proto_records(), table_name, current_schema));
             }
 
-            SetCheckpoint(
-                msg->id().term(), msg->id().index(), 0, "", 0, &checkpoint, last_streamed_op_id);
             ht_of_last_returned_message = HybridTime(msg->hybrid_time());
+            if (CanUpdateCheckpointOpId(
+                    msg, &next_checkpoint_index, all_checkpoints,
+                    ht_of_last_returned_message.ToUint64())) {
+              SetCheckpoint(
+                  all_checkpoints[next_checkpoint_index - 1]->id().term(),
+                  all_checkpoints[next_checkpoint_index - 1]->id().index(), 0, "", 0, &checkpoint,
+                  last_streamed_op_id);
+            }
             checkpoint_updated = true;
           } break;
 
@@ -1908,9 +1897,15 @@ Status GetChangesForCDCSDK(
               saw_non_actionable_message = true;
             }
 
-            SetCheckpoint(
-                msg->id().term(), msg->id().index(), 0, "", 0, &checkpoint, last_streamed_op_id);
             ht_of_last_returned_message = HybridTime(msg->hybrid_time());
+            if (CanUpdateCheckpointOpId(
+                    msg, &next_checkpoint_index, all_checkpoints,
+                    ht_of_last_returned_message.ToUint64())) {
+              SetCheckpoint(
+                  all_checkpoints[next_checkpoint_index - 1]->id().term(),
+                  all_checkpoints[next_checkpoint_index - 1]->id().index(), 0, "", 0, &checkpoint,
+                  last_streamed_op_id);
+            }
           } break;
 
           case yb::consensus::OperationType::SPLIT_OP: {
@@ -1946,8 +1941,15 @@ Status GetChangesForCDCSDK(
                           << ", for parent tablet: " << tablet_id
                           << ", and if we did not see any other records we will report the tablet "
                              "split to the client";
-                SetCheckpoint(op_id.term, op_id.index, 0, "", 0, &checkpoint, last_streamed_op_id);
                 ht_of_last_returned_message = HybridTime(msg->hybrid_time());
+                if (CanUpdateCheckpointOpId(
+                        msg, &next_checkpoint_index, all_checkpoints,
+                        ht_of_last_returned_message.ToUint64())) {
+                  SetCheckpoint(
+                      all_checkpoints[next_checkpoint_index - 1]->id().term(),
+                      all_checkpoints[next_checkpoint_index - 1]->id().index(), 0, "", 0,
+                      &checkpoint, last_streamed_op_id);
+                }
                 checkpoint_updated = true;
                 split_op_id = op_id;
               }
@@ -1957,9 +1959,15 @@ Status GetChangesForCDCSDK(
           default:
             // Nothing to do for other operation types.
             saw_non_actionable_message = true;
-            SetCheckpoint(
-                msg->id().term(), msg->id().index(), 0, "", 0, &checkpoint, last_streamed_op_id);
             ht_of_last_returned_message = HybridTime(msg->hybrid_time());
+            if (CanUpdateCheckpointOpId(
+                    msg, &next_checkpoint_index, all_checkpoints,
+                    ht_of_last_returned_message.ToUint64())) {
+              SetCheckpoint(
+                  all_checkpoints[next_checkpoint_index - 1]->id().term(),
+                  all_checkpoints[next_checkpoint_index - 1]->id().index(), 0, "", 0, &checkpoint,
+                  last_streamed_op_id);
+            }
             VLOG_WITH_FUNC(2) << "Found message of Op type: " << msg->op_type()
                               << ", on tablet: " << tablet_id
                               << ", with OpId: " << msg->id().ShortDebugString();
