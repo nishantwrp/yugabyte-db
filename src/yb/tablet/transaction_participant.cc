@@ -505,6 +505,11 @@ class TransactionParticipant::Impl
     return HybridTime::kInvalid;
   }
 
+  OpId GetHistoricalMaxOpId() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return historical_max_op_id;
+  }
+
   OpId GetRetainOpId() {
     std::lock_guard<std::mutex> lock(mutex_);
     return cdc_sdk_min_checkpoint_op_id_;
@@ -795,6 +800,9 @@ class TransactionParticipant::Impl
     auto lock_and_iterator = VERIFY_RESULT(LockAndFind(
         data.transaction_id, "apply"s, TransactionLoadFlags{TransactionLoadFlag::kMustExist}));
     if (lock_and_iterator.found()) {
+      if (!historical_max_op_id.valid() || data.op_id > historical_max_op_id) {
+        historical_max_op_id = data.op_id;
+      }
       lock_and_iterator.transaction().SetApplyOpId(data.op_id);
       if (!apply_state.active()) {
         RemoveUnlocked(lock_and_iterator.iterator, RemoveReason::kApplied, &min_running_notifier);
@@ -1915,6 +1923,7 @@ class TransactionParticipant::Impl
   rpc::Poller wait_queue_poller_;
 
   OpId cdc_sdk_min_checkpoint_op_id_ = OpId::Invalid();
+  OpId historical_max_op_id = OpId::Invalid();
   CoarseTimePoint cdc_sdk_min_checkpoint_op_id_expiration_ = CoarseTimePoint::min();
 
   std::condition_variable requests_completed_cond_;
@@ -2141,6 +2150,8 @@ OpId TransactionParticipant::GetLatestCheckPoint() const {
 HybridTime TransactionParticipant::GetMinStartTimeAmongAllRunningTransactions() const {
   return impl_->GetMinStartTimeAmongAllRunningTransactions();
 }
+
+OpId TransactionParticipant::GetHistoricalMaxOpId() const { return impl_->GetHistoricalMaxOpId(); }
 
 }  // namespace tablet
 }  // namespace yb

@@ -1346,7 +1346,8 @@ Status GetConsistentWALRecords(
     consensus::ReplicateMsgsHolder* msgs_holder, ScopedTrackedConsumption* consumption,
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* consistent_wal_records,
     std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>* all_checkpoints,
-    const uint64_t& consistent_safe_time, OpId* last_seen_op_id, int64_t** last_readable_opid_index,
+    const uint64_t& consistent_safe_time, const OpId& historical_max_op_id,
+    bool* wait_for_wal_update, OpId* last_seen_op_id, int64_t** last_readable_opid_index,
     const int64_t& safe_hybrid_time, const CoarseTimePoint& deadline) {
   int non_transaction_ops = 0;
   bool found_transaction_op = false;
@@ -1414,6 +1415,12 @@ Status GetConsistentWALRecords(
     }
   } while ((!stop_fetching_messages) &&
            ((*last_readable_opid_index) && last_seen_op_id->index < **last_readable_opid_index));
+
+  // Handle the case where WAL doesn't have the apply record for all the committed transactions.
+  if (!stop_fetching_messages && historical_max_op_id.valid() &&
+      historical_max_op_id > *last_seen_op_id) {
+    (*wait_for_wal_update) = true;
+  }
 
   SortConsistentWALRecords(consistent_wal_records, non_transaction_ops);
   VLOG_WITH_FUNC(1) << "Got a total of " << consistent_wal_records->size() << " WAL records in the"
@@ -1530,9 +1537,11 @@ Status GetChangesForCDCSDK(
   bool report_tablet_split = false;
   OpId split_op_id = OpId::Invalid();
   bool snapshot_operation = false;
+  bool wait_for_wal_update = false;
 
   auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet_safe());
   uint64_t consistent_stream_safe_time = GetConsistentStreamSafeTime(tablet_peer, tablet_ptr);
+  OpId historical_max_op_id = tablet_ptr->transaction_participant()->GetHistoricalMaxOpId();
   auto leader_safe_time = tablet_ptr->SafeTime();
   if (!leader_safe_time.ok()) {
     YB_LOG_EVERY_N_SECS(WARNING, 10)
@@ -1665,13 +1674,17 @@ Status GetChangesForCDCSDK(
     if (FLAGS_cdc_enable_consistent_records)
       RETURN_NOT_OK(GetConsistentWALRecords(
           tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_wal_records,
-          &all_checkpoints, consistent_stream_safe_time, &last_seen_op_id,
-          &last_readable_opid_index, safe_hybrid_time, deadline));
+          &all_checkpoints, consistent_stream_safe_time, historical_max_op_id, &wait_for_wal_update,
+          &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time, deadline));
     else
       RETURN_NOT_OK(GetWALRecords(
           tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_wal_records,
           &all_checkpoints, consistent_stream_safe_time, &last_seen_op_id,
           &last_readable_opid_index, safe_hybrid_time, deadline, true));
+
+    // We don't need to wait for wal to get updated in this case because we will anyways stream
+    // only until we complete this transaction.
+    wait_for_wal_update = false;
 
     have_more_messages = HaveMoreMessages(true);
 
@@ -1732,13 +1745,23 @@ Status GetChangesForCDCSDK(
       if (FLAGS_cdc_enable_consistent_records)
         RETURN_NOT_OK(GetConsistentWALRecords(
             tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_wal_records,
-            &all_checkpoints, consistent_stream_safe_time, &last_seen_op_id,
-            &last_readable_opid_index, safe_hybrid_time, deadline));
+            &all_checkpoints, consistent_stream_safe_time, historical_max_op_id,
+            &wait_for_wal_update, &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time,
+            deadline));
       else
         RETURN_NOT_OK(GetWALRecords(
             tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_wal_records,
             &all_checkpoints, consistent_stream_safe_time, &last_seen_op_id,
             &last_readable_opid_index, safe_hybrid_time, deadline, false));
+
+      if (wait_for_wal_update) {
+        VLOG_WITH_FUNC(1)
+            << "Returning an empty response because WAL is not up to date with apply records "
+               "of all comitted transactions. historical_max_op_id: "
+            << historical_max_op_id.ToString()
+            << ", last_seen_op_id: " << last_seen_op_id.ToString();
+        break;
+      }
 
       if (consistent_wal_records.empty()) {
         VLOG_WITH_FUNC(1)
@@ -1981,9 +2004,10 @@ Status GetChangesForCDCSDK(
     consumption.Add(resp->SpaceUsedLong());
   }
 
-  auto safe_time = GetCDCSDKSafeTimeForTarget(
-      leader_safe_time.get(), ht_of_last_returned_message, have_more_messages,
-      consistent_stream_safe_time);
+  auto safe_time = wait_for_wal_update ? HybridTime(safe_hybrid_time)
+                                       : GetCDCSDKSafeTimeForTarget(
+                                             leader_safe_time.get(), ht_of_last_returned_message,
+                                             have_more_messages, consistent_stream_safe_time);
   resp->set_safe_hybrid_time(safe_time.ToUint64());
   VLOG(1) << "The safe_hybrid_time in response is set to " << resp->safe_hybrid_time();
 
