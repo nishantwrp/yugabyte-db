@@ -1763,6 +1763,7 @@ Status GetChangesForCDCSDK(
 
       Schema current_schema = *tablet_ptr->metadata()->schema();
       bool pending_intents = false;
+      bool saw_split_op = false;
 
       for (const auto& msg : consistent_wal_records) {
         switch (msg->op_type()) {
@@ -1917,6 +1918,9 @@ Status GetChangesForCDCSDK(
             const TableId& table_id = tablet_ptr->metadata()->table_id();
             auto op_id = OpId::FromPB(msg->id());
 
+            // Set 'saw_split_op' to true only if the split op is for the current tablet.
+            if (msg->split_request().tablet_id() == tablet_id) saw_split_op = true;
+
             if (!(VerifyTabletSplitOnParentTablet(table_id, tablet_id, client))) {
               // We could verify the tablet split succeeded. This is possible when the child tablets
               // of a split are not running yet.
@@ -1975,6 +1979,11 @@ Status GetChangesForCDCSDK(
         }
 
         if (pending_intents) {
+          break;
+        }
+
+        // There can be NO_OP messages after a SPLIT_OP. Ignore them.
+        if (saw_split_op) {
           break;
         }
       }
