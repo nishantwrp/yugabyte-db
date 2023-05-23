@@ -1479,11 +1479,12 @@ bool CanUpdateCheckpointOpId(
 }
 
 uint64_t GetConsistentStreamSafeTime(
-    const std::shared_ptr<tablet::TabletPeer>& tablet_peer, const tablet::TabletPtr& tablet_ptr) {
+    const std::shared_ptr<tablet::TabletPeer>& tablet_peer, const tablet::TabletPtr& tablet_ptr,
+    const HybridTime& leader_safe_time) {
   HybridTime consistent_stream_safe_time =
       tablet_ptr->transaction_participant()->GetMinStartTimeAmongAllRunningTransactions();
   return consistent_stream_safe_time == HybridTime::kInvalid
-             ? tablet_peer->SafeTimeForTransactionParticipant().ToUint64()
+             ? leader_safe_time.ToUint64()
              : consistent_stream_safe_time.ToUint64();
 }
 
@@ -1521,14 +1522,15 @@ Status GetChangesForCDCSDK(
   bool wait_for_wal_update = false;
 
   auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet_safe());
-  uint64_t consistent_stream_safe_time = GetConsistentStreamSafeTime(tablet_peer, tablet_ptr);
-  OpId historical_max_op_id = tablet_ptr->transaction_participant()->GetHistoricalMaxOpId();
   auto leader_safe_time = tablet_ptr->SafeTime();
   if (!leader_safe_time.ok()) {
     YB_LOG_EVERY_N_SECS(WARNING, 10)
         << "Could not compute safe time: " << leader_safe_time.status();
     leader_safe_time = HybridTime::kInvalid;
   }
+  uint64_t consistent_stream_safe_time =
+      GetConsistentStreamSafeTime(tablet_peer, tablet_ptr, leader_safe_time.get());
+  OpId historical_max_op_id = tablet_ptr->transaction_participant()->GetHistoricalMaxOpId();
   auto table_name = tablet_ptr->metadata()->table_name();
 
   auto ht_of_last_returned_message = HybridTime::kInvalid;
