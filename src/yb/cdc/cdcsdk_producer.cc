@@ -1480,11 +1480,14 @@ bool CanUpdateCheckpointOpId(
 
 uint64_t GetConsistentStreamSafeTime(
     const std::shared_ptr<tablet::TabletPeer>& tablet_peer, const tablet::TabletPtr& tablet_ptr,
-    const HybridTime& leader_safe_time) {
+    const HybridTime& leader_safe_time, const int64_t& safe_hybrid_time) {
   HybridTime consistent_stream_safe_time =
       tablet_ptr->transaction_participant()->GetMinStartTimeAmongAllRunningTransactions();
-  return consistent_stream_safe_time == HybridTime::kInvalid
-             ? leader_safe_time.ToUint64()
+  consistent_stream_safe_time = consistent_stream_safe_time == HybridTime::kInvalid
+                                    ? leader_safe_time
+                                    : consistent_stream_safe_time;
+  return safe_hybrid_time > 0
+             ? std::max(consistent_stream_safe_time.ToUint64(), (uint64_t)safe_hybrid_time)
              : consistent_stream_safe_time.ToUint64();
 }
 
@@ -1528,8 +1531,8 @@ Status GetChangesForCDCSDK(
         << "Could not compute safe time: " << leader_safe_time.status();
     leader_safe_time = HybridTime::kInvalid;
   }
-  uint64_t consistent_stream_safe_time =
-      GetConsistentStreamSafeTime(tablet_peer, tablet_ptr, leader_safe_time.get());
+  uint64_t consistent_stream_safe_time = GetConsistentStreamSafeTime(
+      tablet_peer, tablet_ptr, leader_safe_time.get(), safe_hybrid_time);
   OpId historical_max_op_id = tablet_ptr->transaction_participant()->GetHistoricalMaxOpId();
   auto table_name = tablet_ptr->metadata()->table_name();
 

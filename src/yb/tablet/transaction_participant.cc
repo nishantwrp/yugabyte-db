@@ -136,6 +136,12 @@ std::string TransactionApplyData::ToString() const {
       apply_state, is_external);
 }
 
+void UpdateHistoricalMaxOpId(std::atomic<OpId>* historical_max_op_id, OpId const& op_id) {
+  OpId prev_value = (*historical_max_op_id);
+  while (prev_value < op_id && !historical_max_op_id->compare_exchange_weak(prev_value, op_id)) {
+  }
+}
+
 class TransactionParticipant::Impl
     : public RunningTransactionContext, public TransactionLoaderContext {
  public:
@@ -507,7 +513,7 @@ class TransactionParticipant::Impl
 
   OpId GetHistoricalMaxOpId() {
     std::lock_guard<std::mutex> lock(mutex_);
-    return historical_max_op_id;
+    return historical_max_op_id.load();
   }
 
   OpId GetRetainOpId() {
@@ -757,6 +763,7 @@ class TransactionParticipant::Impl
             << "Transaction was previously applied with another commit ht: " << existing_commit_ht
             << ", new commit ht: " << data.commit_ht;
       } else {
+        UpdateHistoricalMaxOpId(&historical_max_op_id, data.op_id);
         CHECK(transactions_.modify(lock_and_iterator.iterator, [&data](auto& txn) {
           txn->SetLocalCommitData(data.commit_ht, data.aborted);
         }));
@@ -800,9 +807,6 @@ class TransactionParticipant::Impl
     auto lock_and_iterator = VERIFY_RESULT(LockAndFind(
         data.transaction_id, "apply"s, TransactionLoadFlags{TransactionLoadFlag::kMustExist}));
     if (lock_and_iterator.found()) {
-      if (!historical_max_op_id.valid() || data.op_id > historical_max_op_id) {
-        historical_max_op_id = data.op_id;
-      }
       lock_and_iterator.transaction().SetApplyOpId(data.op_id);
       if (!apply_state.active()) {
         RemoveUnlocked(lock_and_iterator.iterator, RemoveReason::kApplied, &min_running_notifier);
@@ -1923,7 +1927,7 @@ class TransactionParticipant::Impl
   rpc::Poller wait_queue_poller_;
 
   OpId cdc_sdk_min_checkpoint_op_id_ = OpId::Invalid();
-  OpId historical_max_op_id = OpId::Invalid();
+  std::atomic<OpId> historical_max_op_id = OpId::Invalid();
   CoarseTimePoint cdc_sdk_min_checkpoint_op_id_expiration_ = CoarseTimePoint::min();
 
   std::condition_variable requests_completed_cond_;
