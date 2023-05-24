@@ -320,8 +320,9 @@ Result<size_t> PopulatePackedRows(
 
 HybridTime GetCDCSDKSafeTimeForTarget(
     const HybridTime leader_safe_time, HybridTime ht_of_last_returned_message,
-    HaveMoreMessages have_more_messages, const uint64_t& consistent_stream_safe_time) {
-  if (FLAGS_cdc_enable_consistent_records) {
+    HaveMoreMessages have_more_messages, const uint64_t& consistent_stream_safe_time,
+    const bool& is_snapshot_operation) {
+  if (FLAGS_cdc_enable_consistent_records && !is_snapshot_operation) {
     if (ht_of_last_returned_message.is_valid()) {
       return ht_of_last_returned_message;
     }
@@ -1480,11 +1481,14 @@ bool CanUpdateCheckpointOpId(
 
 uint64_t GetConsistentStreamSafeTime(
     const std::shared_ptr<tablet::TabletPeer>& tablet_peer, const tablet::TabletPtr& tablet_ptr,
-    const HybridTime& leader_safe_time) {
+    const HybridTime& leader_safe_time, const int64_t& safe_hybrid_time) {
   HybridTime consistent_stream_safe_time =
       tablet_ptr->transaction_participant()->GetMinStartTimeAmongAllRunningTransactions();
-  return consistent_stream_safe_time == HybridTime::kInvalid
-             ? leader_safe_time.ToUint64()
+  consistent_stream_safe_time = consistent_stream_safe_time == HybridTime::kInvalid
+                                    ? leader_safe_time
+                                    : consistent_stream_safe_time;
+  return safe_hybrid_time > 0
+             ? std::max(consistent_stream_safe_time.ToUint64(), (uint64_t)safe_hybrid_time)
              : consistent_stream_safe_time.ToUint64();
 }
 
@@ -1528,8 +1532,8 @@ Status GetChangesForCDCSDK(
         << "Could not compute safe time: " << leader_safe_time.status();
     leader_safe_time = HybridTime::kInvalid;
   }
-  uint64_t consistent_stream_safe_time =
-      GetConsistentStreamSafeTime(tablet_peer, tablet_ptr, leader_safe_time.get());
+  uint64_t consistent_stream_safe_time = GetConsistentStreamSafeTime(
+      tablet_peer, tablet_ptr, leader_safe_time.get(), safe_hybrid_time);
   OpId historical_max_op_id = tablet_ptr->transaction_participant()->GetHistoricalMaxOpId();
   auto table_name = tablet_ptr->metadata()->table_name();
 
@@ -2023,10 +2027,11 @@ Status GetChangesForCDCSDK(
     consumption.Add(resp->SpaceUsedLong());
   }
 
-  auto safe_time = wait_for_wal_update ? HybridTime(safe_hybrid_time)
-                                       : GetCDCSDKSafeTimeForTarget(
-                                             leader_safe_time.get(), ht_of_last_returned_message,
-                                             have_more_messages, consistent_stream_safe_time);
+  auto safe_time = wait_for_wal_update
+                       ? HybridTime(safe_hybrid_time)
+                       : GetCDCSDKSafeTimeForTarget(
+                             leader_safe_time.get(), ht_of_last_returned_message,
+                             have_more_messages, consistent_stream_safe_time, snapshot_operation);
   resp->set_safe_hybrid_time(safe_time.ToUint64());
   VLOG(1) << "The safe_hybrid_time in response is set to " << resp->safe_hybrid_time();
 
