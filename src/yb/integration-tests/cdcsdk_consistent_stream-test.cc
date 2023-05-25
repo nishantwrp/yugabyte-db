@@ -666,22 +666,35 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKHistoricalMaxOpId)) {
 
   // Aborted transactions shouldn't change max_op_id.
   ASSERT_OK(WriteRowsHelper(0, 100, &test_cluster_, false));
+  SleepFor(MonoDelta::FromSeconds(5));
   ASSERT_EQ(GetHistoricalMaxOpId(tablets), OpId::Invalid());
 
   // Committed transactions should change max_op_id.
   ASSERT_OK(WriteRowsHelper(100, 200, &test_cluster_, true));
-  OpId historical_max_op_id = GetHistoricalMaxOpId(tablets);
-  ASSERT_NE(historical_max_op_id, OpId::Invalid());
+  OpId historical_max_op_id;
+  ASSERT_OK(WaitFor(
+      [&]() {
+        historical_max_op_id = GetHistoricalMaxOpId(tablets);
+        return historical_max_op_id > OpId::Invalid();
+      },
+      MonoDelta::FromSeconds(5),
+      "historical_max_op_id should change"));
 
   // Aborted transactions shouldn't change max_op_id.
   ASSERT_OK(WriteRowsHelper(200, 300, &test_cluster_, false));
+  SleepFor(MonoDelta::FromSeconds(5));
   OpId new_historical_max_op_id = GetHistoricalMaxOpId(tablets);
   ASSERT_EQ(new_historical_max_op_id, historical_max_op_id);
 
   // Committed transactions should change max_op_id.
   ASSERT_OK(WriteRowsHelper(300, 400, &test_cluster_, true));
-  new_historical_max_op_id = GetHistoricalMaxOpId(tablets);
-  ASSERT_GE(new_historical_max_op_id, historical_max_op_id);
+  ASSERT_OK(WaitFor(
+      [&]() {
+        new_historical_max_op_id = GetHistoricalMaxOpId(tablets);
+        return new_historical_max_op_id > historical_max_op_id;
+      },
+      MonoDelta::FromSeconds(5),
+      "historical_max_op_id should change"));
 }
 
 TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKHistoricalMaxOpIdWithTserverRestart)) {
@@ -697,19 +710,26 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKHistoricalMaxOpIdWithTs
 
   // Committed transactions should change max_op_id.
   ASSERT_OK(WriteRowsHelper(0, 100, &test_cluster_, true));
-  OpId historical_max_op_id = GetHistoricalMaxOpId(tablets);
-  ASSERT_NE(historical_max_op_id, OpId::Invalid());
+  OpId historical_max_op_id;
+  ASSERT_OK(WaitFor(
+      [&]() {
+        historical_max_op_id = GetHistoricalMaxOpId(tablets);
+        return historical_max_op_id > OpId::Invalid();
+      },
+      MonoDelta::FromSeconds(5),
+      "historical_max_op_id should change"));
 
   // Restart all tservers.
   for (size_t i = 0; i < test_cluster()->num_tablet_servers(); ++i) {
     test_cluster()->mini_tablet_server(i)->Shutdown();
     ASSERT_OK(test_cluster()->mini_tablet_server(i)->Start());
   }
-  SleepFor(MonoDelta::FromSeconds(30));
 
   // Should be same as before restart.
-  OpId new_historical_max_op_id = GetHistoricalMaxOpId(tablets);
-  ASSERT_EQ(new_historical_max_op_id, historical_max_op_id);
+  ASSERT_OK(WaitFor(
+      [&]() { return GetHistoricalMaxOpId(tablets) == historical_max_op_id; },
+      MonoDelta::FromSeconds(30),
+      "historical_max_op_id should be same as before restart"));
 }
 
 TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKHistoricalMaxOpIdWithTabletSplit)) {
@@ -725,8 +745,14 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKHistoricalMaxOpIdWithTa
 
   // Committed transactions should change max_op_id.
   ASSERT_OK(WriteRowsHelper(0, 100, &test_cluster_, true));
-  OpId historical_max_op_id = GetHistoricalMaxOpId(tablets);
-  ASSERT_NE(historical_max_op_id, OpId::Invalid());
+  OpId historical_max_op_id;
+  ASSERT_OK(WaitFor(
+      [&]() {
+        historical_max_op_id = GetHistoricalMaxOpId(tablets);
+        return historical_max_op_id > OpId::Invalid();
+      },
+      MonoDelta::FromSeconds(5),
+      "historical_max_op_id should change"));
 
   ASSERT_OK(test_client()->FlushTables({table.table_id()}, false, 1000, true));
   ASSERT_OK(test_cluster_.mini_cluster_->CompactTablets());
@@ -743,10 +769,13 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKHistoricalMaxOpIdWithTa
   ASSERT_EQ(new_historical_max_op_id, OpId::Invalid());
 
   ASSERT_OK(WriteRowsHelper(1000, 2000, &test_cluster_, true));
-  new_historical_max_op_id = GetHistoricalMaxOpId(tablets_after_first_split);
-  ASSERT_GE(new_historical_max_op_id, historical_max_op_id);
-  new_historical_max_op_id = GetHistoricalMaxOpId(tablets_after_first_split, 1);
-  ASSERT_GE(new_historical_max_op_id, historical_max_op_id);
+  ASSERT_OK(WaitFor(
+      [&]() {
+        return (GetHistoricalMaxOpId(tablets_after_first_split) > historical_max_op_id) &&
+               (GetHistoricalMaxOpId(tablets_after_first_split, 1) > historical_max_op_id);
+      },
+      MonoDelta::FromSeconds(5),
+      "historical_max_op_id should change"));
 }
 
 }  // namespace cdc
