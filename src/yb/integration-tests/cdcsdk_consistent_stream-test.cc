@@ -653,5 +653,101 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKConsistentStreamWithTab
   }
 }
 
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKHistoricalMaxOpId)) {
+  ASSERT_OK(SetUpWithParams(3, 1, false));
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName));
+  TableId table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 1);
+
+  // Should be -1.-1 in the beginning.
+  ASSERT_EQ(GetHistoricalMaxOpId(tablets), OpId::Invalid());
+
+  // Aborted transactions shouldn't change max_op_id.
+  ASSERT_OK(WriteRowsHelper(0, 100, &test_cluster_, false));
+  ASSERT_EQ(GetHistoricalMaxOpId(tablets), OpId::Invalid());
+
+  // Committed transactions should change max_op_id.
+  ASSERT_OK(WriteRowsHelper(100, 200, &test_cluster_, true));
+  OpId historical_max_op_id = GetHistoricalMaxOpId(tablets);
+  ASSERT_NE(historical_max_op_id, OpId::Invalid());
+
+  // Aborted transactions shouldn't change max_op_id.
+  ASSERT_OK(WriteRowsHelper(200, 300, &test_cluster_, false));
+  OpId new_historical_max_op_id = GetHistoricalMaxOpId(tablets);
+  ASSERT_EQ(new_historical_max_op_id, historical_max_op_id);
+
+  // Committed transactions should change max_op_id.
+  ASSERT_OK(WriteRowsHelper(300, 400, &test_cluster_, true));
+  new_historical_max_op_id = GetHistoricalMaxOpId(tablets);
+  ASSERT_GE(new_historical_max_op_id, historical_max_op_id);
+}
+
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKHistoricalMaxOpIdWithTserverRestart)) {
+  ASSERT_OK(SetUpWithParams(3, 1, false));
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName));
+  TableId table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 1);
+
+  // Should be -1.-1 in the beginning.
+  ASSERT_EQ(GetHistoricalMaxOpId(tablets), OpId::Invalid());
+
+  // Committed transactions should change max_op_id.
+  ASSERT_OK(WriteRowsHelper(0, 100, &test_cluster_, true));
+  OpId historical_max_op_id = GetHistoricalMaxOpId(tablets);
+  ASSERT_NE(historical_max_op_id, OpId::Invalid());
+
+  // Restart all tservers.
+  for (size_t i = 0; i < test_cluster()->num_tablet_servers(); ++i) {
+    test_cluster()->mini_tablet_server(i)->Shutdown();
+    ASSERT_OK(test_cluster()->mini_tablet_server(i)->Start());
+  }
+  SleepFor(MonoDelta::FromSeconds(30));
+
+  // Should be same as before restart.
+  OpId new_historical_max_op_id = GetHistoricalMaxOpId(tablets);
+  ASSERT_EQ(new_historical_max_op_id, historical_max_op_id);
+}
+
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKHistoricalMaxOpIdWithTabletSplit)) {
+  ASSERT_OK(SetUpWithParams(3, 1, false));
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName));
+  TableId table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 1);
+
+  // Should be -1.-1 in the beginning.
+  ASSERT_EQ(GetHistoricalMaxOpId(tablets), OpId::Invalid());
+
+  // Committed transactions should change max_op_id.
+  ASSERT_OK(WriteRowsHelper(0, 100, &test_cluster_, true));
+  OpId historical_max_op_id = GetHistoricalMaxOpId(tablets);
+  ASSERT_NE(historical_max_op_id, OpId::Invalid());
+
+  ASSERT_OK(test_client()->FlushTables({table.table_id()}, false, 1000, true));
+  ASSERT_OK(test_cluster_.mini_cluster_->CompactTablets());
+  WaitUntilSplitIsSuccesful(tablets.Get(0).tablet_id(), table);
+
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets_after_first_split;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets_after_first_split, nullptr));
+  ASSERT_EQ(tablets_after_first_split.size(), 2);
+
+  // Should be same as before split.
+  OpId new_historical_max_op_id = GetHistoricalMaxOpId(tablets_after_first_split);
+  ASSERT_EQ(new_historical_max_op_id, OpId::Invalid());
+  new_historical_max_op_id = GetHistoricalMaxOpId(tablets_after_first_split, 1);
+  ASSERT_EQ(new_historical_max_op_id, OpId::Invalid());
+
+  ASSERT_OK(WriteRowsHelper(1000, 2000, &test_cluster_, true));
+  new_historical_max_op_id = GetHistoricalMaxOpId(tablets_after_first_split);
+  ASSERT_GE(new_historical_max_op_id, historical_max_op_id);
+  new_historical_max_op_id = GetHistoricalMaxOpId(tablets_after_first_split, 1);
+  ASSERT_GE(new_historical_max_op_id, historical_max_op_id);
+}
+
 }  // namespace cdc
 }  // namespace yb

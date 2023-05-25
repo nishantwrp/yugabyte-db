@@ -3176,6 +3176,20 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
     }
   }
 
+  OpId GetHistoricalMaxOpId(
+      const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
+      const int& tablet_idx = 0) {
+    for (size_t i = 0; i < test_cluster()->num_tablet_servers(); ++i) {
+      for (const auto& peer : test_cluster()->GetTabletPeers(i)) {
+        if (peer->tablet_id() == tablets[tablet_idx].tablet_id() &&
+            peer->LeaderStatus() != consensus::LeaderStatus::NOT_LEADER) {
+          return peer->tablet()->transaction_participant()->GetHistoricalMaxOpId();
+        }
+      }
+    }
+    return OpId::Invalid();
+  }
+
   TableId GetColocatedTableId(const std::string& req_table_name) {
     for (const auto& peer : test_cluster()->GetTabletPeers(0)) {
       for (const auto& table_id : peer->tablet_metadata()->GetAllColocatedTables()) {
