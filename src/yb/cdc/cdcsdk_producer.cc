@@ -1492,6 +1492,36 @@ uint64_t GetConsistentStreamSafeTime(
              : consistent_stream_safe_time.ToUint64();
 }
 
+void UpdateCheckpointIfPossible(
+    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg,
+    HybridTime* ht_of_last_returned_message, size_t* next_checkpoint_index,
+    const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints,
+    CDCSDKCheckpointPB* checkpoint, OpId* last_streamed_op_id) {
+  (*ht_of_last_returned_message) = HybridTime(msg->hybrid_time());
+  if (CanUpdateCheckpointOpId(
+          msg, next_checkpoint_index, all_checkpoints, ht_of_last_returned_message->ToUint64())) {
+    auto msg = all_checkpoints[(*next_checkpoint_index) - 1];
+    SetCheckpoint(msg->id().term(), msg->id().index(), 0, "", 0, checkpoint, last_streamed_op_id);
+  }
+}
+
+void UpdateCheckpointForMultiShardTxnIfPossible(
+    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg,
+    HybridTime* ht_of_last_returned_message, size_t* next_checkpoint_index,
+    const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints,
+    CDCSDKCheckpointPB* checkpoint, OpId* last_streamed_op_id) {
+  (*ht_of_last_returned_message) = HybridTime(GetTransactionCommitTime(msg));
+  if (CanUpdateCheckpointOpId(
+          msg, next_checkpoint_index, all_checkpoints, ht_of_last_returned_message->ToUint64())) {
+    auto msg = all_checkpoints[(*next_checkpoint_index) - 1];
+    int64_t term = msg->id().term();
+    int64_t index = msg->id().index();
+    SetTermIndex(term, index, checkpoint);
+    last_streamed_op_id->term = term;
+    last_streamed_op_id->index = index;
+  }
+}
+
 // CDC get changes is different from xCluster as it doesn't need
 // to read intents from WAL.
 
@@ -1699,16 +1729,9 @@ Status GetChangesForCDCSDK(
         cached_schema_details, commit_timestamp));
 
     if (checkpoint.write_id() == 0 && checkpoint.key().empty() && consistent_wal_records.size()) {
-      ht_of_last_returned_message = HybridTime(commit_timestamp);
-      if (CanUpdateCheckpointOpId(
-              consistent_wal_records[0], &next_checkpoint_index, all_checkpoints,
-              ht_of_last_returned_message.ToUint64())) {
-        int64_t term = all_checkpoints[next_checkpoint_index - 1]->id().term();
-        int64_t index = all_checkpoints[next_checkpoint_index - 1]->id().index();
-        SetTermIndex(term, index, &checkpoint);
-        last_streamed_op_id->term = term;
-        last_streamed_op_id->index = index;
-      }
+      UpdateCheckpointForMultiShardTxnIfPossible(
+          consistent_wal_records[0], &ht_of_last_returned_message, &next_checkpoint_index,
+          all_checkpoints, &checkpoint, last_streamed_op_id);
     } else {
       if (ht_of_last_returned_message == HybridTime::kInvalid) {
         ht_of_last_returned_message = HybridTime(safe_hybrid_time);
@@ -1799,16 +1822,9 @@ Status GetChangesForCDCSDK(
                   ht_of_last_returned_message = HybridTime(safe_hybrid_time);
                 }
               } else {
-                ht_of_last_returned_message = HybridTime(GetTransactionCommitTime(msg));
-                if (CanUpdateCheckpointOpId(
-                        msg, &next_checkpoint_index, all_checkpoints,
-                        ht_of_last_returned_message.ToUint64())) {
-                  int64_t term = all_checkpoints[next_checkpoint_index - 1]->id().term();
-                  int64_t index = all_checkpoints[next_checkpoint_index - 1]->id().index();
-                  SetTermIndex(term, index, &checkpoint);
-                  last_streamed_op_id->term = term;
-                  last_streamed_op_id->index = index;
-                }
+                UpdateCheckpointForMultiShardTxnIfPossible(
+                    msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
+                    &checkpoint, last_streamed_op_id);
               }
               checkpoint_updated = true;
             }
@@ -1823,15 +1839,9 @@ Status GetChangesForCDCSDK(
                   msg, stream_metadata, tablet_peer, enum_oid_label_map, composite_atts_map,
                   cached_schema_details, resp, client));
 
-              ht_of_last_returned_message = HybridTime(GetTransactionCommitTime(msg));
-              if (CanUpdateCheckpointOpId(
-                      msg, &next_checkpoint_index, all_checkpoints,
-                      ht_of_last_returned_message.ToUint64())) {
-                SetCheckpoint(
-                    all_checkpoints[next_checkpoint_index - 1]->id().term(),
-                    all_checkpoints[next_checkpoint_index - 1]->id().index(), 0, "", 0, &checkpoint,
-                    last_streamed_op_id);
-              }
+              UpdateCheckpointIfPossible(
+                  msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
+                  &checkpoint, last_streamed_op_id);
               checkpoint_updated = true;
             }
           } break;
@@ -1883,15 +1893,9 @@ Status GetChangesForCDCSDK(
                   msg, resp->add_cdc_sdk_proto_records(), table_name, current_schema));
             }
 
-            ht_of_last_returned_message = HybridTime(msg->hybrid_time());
-            if (CanUpdateCheckpointOpId(
-                    msg, &next_checkpoint_index, all_checkpoints,
-                    ht_of_last_returned_message.ToUint64())) {
-              SetCheckpoint(
-                  all_checkpoints[next_checkpoint_index - 1]->id().term(),
-                  all_checkpoints[next_checkpoint_index - 1]->id().index(), 0, "", 0, &checkpoint,
-                  last_streamed_op_id);
-            }
+            UpdateCheckpointIfPossible(
+                msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
+                &checkpoint, last_streamed_op_id);
             checkpoint_updated = true;
           } break;
 
@@ -1904,15 +1908,9 @@ Status GetChangesForCDCSDK(
               saw_non_actionable_message = true;
             }
 
-            ht_of_last_returned_message = HybridTime(msg->hybrid_time());
-            if (CanUpdateCheckpointOpId(
-                    msg, &next_checkpoint_index, all_checkpoints,
-                    ht_of_last_returned_message.ToUint64())) {
-              SetCheckpoint(
-                  all_checkpoints[next_checkpoint_index - 1]->id().term(),
-                  all_checkpoints[next_checkpoint_index - 1]->id().index(), 0, "", 0, &checkpoint,
-                  last_streamed_op_id);
-            }
+            UpdateCheckpointIfPossible(
+                msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
+                &checkpoint, last_streamed_op_id);
           } break;
 
           case yb::consensus::OperationType::SPLIT_OP: {
@@ -1924,8 +1922,17 @@ Status GetChangesForCDCSDK(
             const TableId& table_id = tablet_ptr->metadata()->table_id();
             auto op_id = OpId::FromPB(msg->id());
 
+            // Handle if SPLIT_OP corresponds to the parent tablet.
+            if (msg->split_request().tablet_id() != tablet_id) {
+              saw_non_actionable_message = true;
+              UpdateCheckpointIfPossible(
+                  msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
+                  &checkpoint, last_streamed_op_id);
+              break;
+            }
+
             // Set 'saw_split_op' to true only if the split op is for the current tablet.
-            if (msg->split_request().tablet_id() == tablet_id) saw_split_op = true;
+            saw_split_op = true;
 
             if (!(VerifyTabletSplitOnParentTablet(table_id, tablet_id, client))) {
               // We could verify the tablet split succeeded. This is possible when the child tablets
@@ -1951,15 +1958,10 @@ Status GetChangesForCDCSDK(
                           << ", for parent tablet: " << tablet_id
                           << ", and if we did not see any other records we will report the tablet "
                              "split to the client";
-                ht_of_last_returned_message = HybridTime(msg->hybrid_time());
-                if (CanUpdateCheckpointOpId(
-                        msg, &next_checkpoint_index, all_checkpoints,
-                        ht_of_last_returned_message.ToUint64())) {
-                  SetCheckpoint(
-                      all_checkpoints[next_checkpoint_index - 1]->id().term(),
-                      all_checkpoints[next_checkpoint_index - 1]->id().index(), 0, "", 0,
-                      &checkpoint, last_streamed_op_id);
-                }
+
+                UpdateCheckpointIfPossible(
+                    msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
+                    &checkpoint, last_streamed_op_id);
                 checkpoint_updated = true;
                 split_op_id = op_id;
               }
@@ -1969,15 +1971,9 @@ Status GetChangesForCDCSDK(
           default:
             // Nothing to do for other operation types.
             saw_non_actionable_message = true;
-            ht_of_last_returned_message = HybridTime(msg->hybrid_time());
-            if (CanUpdateCheckpointOpId(
-                    msg, &next_checkpoint_index, all_checkpoints,
-                    ht_of_last_returned_message.ToUint64())) {
-              SetCheckpoint(
-                  all_checkpoints[next_checkpoint_index - 1]->id().term(),
-                  all_checkpoints[next_checkpoint_index - 1]->id().index(), 0, "", 0, &checkpoint,
-                  last_streamed_op_id);
-            }
+            UpdateCheckpointIfPossible(
+                msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
+                &checkpoint, last_streamed_op_id);
             VLOG_WITH_FUNC(2) << "Found message of Op type: " << msg->op_type()
                               << ", on tablet: " << tablet_id
                               << ", with OpId: " << msg->id().ShortDebugString();
