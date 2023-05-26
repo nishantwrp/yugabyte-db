@@ -1734,7 +1734,7 @@ Status GetChangesForCDCSDK(
           all_checkpoints, &checkpoint, last_streamed_op_id);
     } else {
       if (ht_of_last_returned_message == HybridTime::kInvalid) {
-        ht_of_last_returned_message = HybridTime(safe_hybrid_time);
+        ht_of_last_returned_message = HybridTime((safe_hybrid_time > 0) ? safe_hybrid_time : 0);
       }
     }
     checkpoint_updated = true;
@@ -1819,7 +1819,8 @@ Status GetChangesForCDCSDK(
                 VLOG(1) << "There are pending intents for the transaction id " << txn_id
                         << " with apply record OpId: " << op_id;
                 if (ht_of_last_returned_message == HybridTime::kInvalid) {
-                  ht_of_last_returned_message = HybridTime(safe_hybrid_time);
+                  ht_of_last_returned_message =
+                      HybridTime((safe_hybrid_time > 0) ? safe_hybrid_time : 0);
                 }
               } else {
                 UpdateCheckpointForMultiShardTxnIfPossible(
@@ -2024,7 +2025,7 @@ Status GetChangesForCDCSDK(
   }
 
   auto safe_time = wait_for_wal_update
-                       ? HybridTime(safe_hybrid_time)
+                       ? HybridTime((safe_hybrid_time > 0) ? safe_hybrid_time : 0)
                        : GetCDCSDKSafeTimeForTarget(
                              leader_safe_time.get(), ht_of_last_returned_message,
                              have_more_messages, consistent_stream_safe_time, snapshot_operation);
