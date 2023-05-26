@@ -1553,7 +1553,6 @@ Status GetChangesForCDCSDK(
   bool report_tablet_split = false;
   OpId split_op_id = OpId::Invalid();
   bool snapshot_operation = false;
-  bool pending_intents = false;
   bool wait_for_wal_update = false;
 
   auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet_safe());
@@ -1734,7 +1733,6 @@ Status GetChangesForCDCSDK(
           consistent_wal_records[0], &ht_of_last_returned_message, &next_checkpoint_index,
           all_checkpoints, &checkpoint, last_streamed_op_id);
     } else {
-      pending_intents = true;
       if (ht_of_last_returned_message == HybridTime::kInvalid) {
         ht_of_last_returned_message = HybridTime(safe_hybrid_time);
       }
@@ -1793,6 +1791,7 @@ Status GetChangesForCDCSDK(
       have_more_messages = HaveMoreMessages(true);
 
       Schema current_schema = *tablet_ptr->metadata()->schema();
+      bool pending_intents = false;
       bool saw_split_op = false;
 
       for (const auto& msg : consistent_wal_records) {
@@ -2057,7 +2056,7 @@ Status GetChangesForCDCSDK(
         TabletSplit, "Tablet Split on tablet: $0, no more records to stream", tablet_id);
   }
 
-  if (FLAGS_cdc_populate_safepoint_record && !pending_intents) {
+  if (FLAGS_cdc_populate_safepoint_record) {
     RETURN_NOT_OK(PopulateCDCSDKSafepointOpRecord(
         safe_time.ToUint64(),
         tablet_peer->tablet()->metadata()->table_name(),
