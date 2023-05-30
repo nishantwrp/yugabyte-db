@@ -2105,6 +2105,15 @@ Status GetChangesForCDCSDK(
     VLOG(2) << "Added Safepoint Record";
   }
 
+  // Populate from_op_id in all cdcsdk records
+  auto cdcsdk_records = resp->mutable_cdc_sdk_proto_records();
+  for (auto& record : (*cdcsdk_records)) {
+    auto record_from_op_id = record.mutable_from_op_id();
+    SetCDCSDKOpId(
+        from_op_id.term(), from_op_id.index(), from_op_id.write_id(), from_op_id.key(),
+        record_from_op_id);
+  }
+
   return Status::OK();
 }
 
