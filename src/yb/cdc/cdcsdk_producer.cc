@@ -1460,6 +1460,44 @@ Status GetWALRecords(
   return Status::OK();
 }
 
+bool HasSplitFailed(
+    const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+    const std::shared_ptr<yb::consensus::LWReplicateMsg>& split_op_msg,
+    const CoarseTimePoint& deadline) {
+  int64_t last_readable_opid_index;
+  OpId last_seen_op_id{split_op_msg->id().term(), split_op_msg->id().index()};
+
+  do {
+    consensus::ReadOpsResult read_ops;
+    auto read_msgs_result = tablet_peer->consensus()->ReadReplicatedMessagesForCDC(
+        last_seen_op_id, &last_readable_opid_index, deadline);
+
+    if (!read_msgs_result.ok()) {
+      VLOG_WITH_FUNC(1) << "Unable to read WAL messges to verify split op failure. Assuming the "
+                           "split op has not failed. split_op: "
+                        << split_op_msg->ShortDebugString()
+                        << ", last_seen_op_id: " << last_seen_op_id.ToString();
+      return false;
+    }
+    read_ops = *read_msgs_result;
+
+    for (const auto& msg : read_ops.messages) {
+      last_seen_op_id.term = msg->id().term();
+      last_seen_op_id.index = msg->id().index();
+
+      if (msg->op_type() == consensus::OperationType::UPDATE_TRANSACTION_OP ||
+          msg->op_type() == consensus::OperationType::WRITE_OP ||
+          msg->op_type() == consensus::OperationType::CHANGE_METADATA_OP ||
+          msg->op_type() == consensus::OperationType::TRUNCATE_OP ||
+          msg->op_type() == consensus::OperationType::SPLIT_OP) {
+        return true;
+      }
+    }
+  } while (last_seen_op_id.index < last_readable_opid_index);
+
+  return false;
+}
+
 bool CanUpdateCheckpointOpId(
     const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, size_t* next_checkpoint_index,
     const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints,
@@ -1924,7 +1962,8 @@ Status GetChangesForCDCSDK(
             auto op_id = OpId::FromPB(msg->id());
 
             // Handle if SPLIT_OP corresponds to the parent tablet.
-            if (msg->split_request().tablet_id() != tablet_id) {
+            if (msg->split_request().tablet_id() != tablet_id ||
+                HasSplitFailed(tablet_peer, msg, deadline)) {
               saw_non_actionable_message = true;
               UpdateCheckpointIfPossible(
                   msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
