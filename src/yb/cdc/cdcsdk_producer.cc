@@ -1476,39 +1476,20 @@ uint64_t ShouldUpdateSafeTime(
 }
 
 bool HasSplitFailed(
-    const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
-    const std::shared_ptr<yb::consensus::LWReplicateMsg>& split_op_msg,
-    const CoarseTimePoint& deadline) {
-  int64_t last_readable_opid_index;
-  OpId last_seen_op_id{split_op_msg->id().term(), split_op_msg->id().index()};
-
-  do {
-    consensus::ReadOpsResult read_ops;
-    auto read_msgs_result = tablet_peer->consensus()->ReadReplicatedMessagesForCDC(
-        last_seen_op_id, &last_readable_opid_index, deadline);
-
-    if (!read_msgs_result.ok()) {
-      VLOG_WITH_FUNC(1) << "Unable to read WAL messges to verify split op failure. Assuming the "
-                           "split op has not failed. split_op: "
-                        << split_op_msg->ShortDebugString()
-                        << ", last_seen_op_id: " << last_seen_op_id.ToString();
-      return false;
+    const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& wal_records,
+    const size_t& split_op_index) {
+  // If there is a wal record that can't exist after a successful split we know
+  // that the split_op corresponds to an unsuccesful split attempt.
+  for (size_t index = split_op_index + 1; index < wal_records.size(); index++) {
+    const auto& msg = wal_records[index];
+    if (msg->op_type() == consensus::OperationType::UPDATE_TRANSACTION_OP ||
+        msg->op_type() == consensus::OperationType::WRITE_OP ||
+        msg->op_type() == consensus::OperationType::CHANGE_METADATA_OP ||
+        msg->op_type() == consensus::OperationType::TRUNCATE_OP ||
+        msg->op_type() == consensus::OperationType::SPLIT_OP) {
+      return true;
     }
-    read_ops = *read_msgs_result;
-
-    for (const auto& msg : read_ops.messages) {
-      last_seen_op_id.term = msg->id().term();
-      last_seen_op_id.index = msg->id().index();
-
-      if (msg->op_type() == consensus::OperationType::UPDATE_TRANSACTION_OP ||
-          msg->op_type() == consensus::OperationType::WRITE_OP ||
-          msg->op_type() == consensus::OperationType::CHANGE_METADATA_OP ||
-          msg->op_type() == consensus::OperationType::TRUNCATE_OP ||
-          msg->op_type() == consensus::OperationType::SPLIT_OP) {
-        return true;
-      }
-    }
-  } while (last_seen_op_id.index < last_readable_opid_index);
+  }
 
   return false;
 }
@@ -2032,7 +2013,7 @@ Status GetChangesForCDCSDK(
 
             // Handle if SPLIT_OP corresponds to the parent tablet.
             if (msg->split_request().tablet_id() != tablet_id ||
-                HasSplitFailed(tablet_peer, msg, deadline)) {
+                HasSplitFailed(consistent_wal_records, index)) {
               saw_non_actionable_message = true;
               UpdateCheckpointIfPossible(
                   msg, ShouldUpdateSafeTime(consistent_wal_records, index), safe_hybrid_time,
