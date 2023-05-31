@@ -179,6 +179,9 @@ message CDCSDKCheckpointPB {
   optional int32 write_id = 4 [default = 0];
   // snapshot_time is used in the context of bootstrap process
   optional uint64 snapshot_time = 5;
+
+  // index used to filter out the records we've already streamed.
+  optional int32 wal_segment_index = 6 [default = 0];
 }
 
 message CDCCheckpointPB {

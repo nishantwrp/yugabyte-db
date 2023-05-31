@@ -319,24 +319,24 @@ Result<size_t> PopulatePackedRows(
 }
 
 HybridTime GetCDCSDKSafeTimeForTarget(
-    const HybridTime leader_safe_time, HybridTime ht_of_last_returned_message,
+    const HybridTime leader_safe_time, HybridTime safe_hybrid_time_resp,
     HaveMoreMessages have_more_messages, const uint64_t& consistent_stream_safe_time,
     const bool& is_snapshot_operation) {
   if (FLAGS_cdc_enable_consistent_records && !is_snapshot_operation) {
-    if (ht_of_last_returned_message.is_valid()) {
-      return ht_of_last_returned_message;
+    if (safe_hybrid_time_resp.is_valid()) {
+      return safe_hybrid_time_resp;
     }
 
     return HybridTime(consistent_stream_safe_time);
   }
 
   if (have_more_messages) {
-    return ht_of_last_returned_message;
+    return safe_hybrid_time_resp;
   }
 
-  if (ht_of_last_returned_message.is_valid()) {
-    if (!leader_safe_time.is_valid() || ht_of_last_returned_message > leader_safe_time) {
-      return ht_of_last_returned_message;
+  if (safe_hybrid_time_resp.is_valid()) {
+    if (!leader_safe_time.is_valid() || safe_hybrid_time_resp > leader_safe_time) {
+      return safe_hybrid_time_resp;
     }
   }
 
@@ -1387,9 +1387,7 @@ Status GetConsistentWALRecords(
       last_seen_op_id->term = msg->id().term();
       last_seen_op_id->index = msg->id().index();
       all_checkpoints->push_back(msg);
-      if ((int64_t)GetTransactionCommitTime(msg) > safe_hybrid_time) {
-        consistent_wal_records->push_back(msg);
-      }
+      consistent_wal_records->push_back(msg);
     }
 
     if (read_ops.messages.size() > 0) {
@@ -1460,6 +1458,23 @@ Status GetWALRecords(
   return Status::OK();
 }
 
+int GetWalSegmentIndex(const CDCSDKCheckpointPB& from_op_id) {
+  if (!FLAGS_cdc_enable_consistent_records) return 0;
+  int wal_segment_index = from_op_id.wal_segment_index();
+  return wal_segment_index >= 0 ? wal_segment_index : 0;
+}
+
+uint64_t ShouldUpdateSafeTime(
+    const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& wal_records,
+    const size_t& current_index) {
+  if (wal_records.size() > (current_index + 1)) {
+    return GetTransactionCommitTime(wal_records[current_index + 1]) !=
+           GetTransactionCommitTime(wal_records[current_index]);
+  }
+
+  return true;
+}
+
 bool HasSplitFailed(
     const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
     const std::shared_ptr<yb::consensus::LWReplicateMsg>& split_op_msg,
@@ -1501,16 +1516,19 @@ bool HasSplitFailed(
 bool CanUpdateCheckpointOpId(
     const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, size_t* next_checkpoint_index,
     const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints,
-    const uint64_t& commit_time) {
+    const uint64_t& commit_time, int* wal_segment_index) {
   bool update_checkpoint = false;
 
   if (!FLAGS_cdc_enable_consistent_records) {
+    (*wal_segment_index)--;
     (*next_checkpoint_index)++;
     return true;
   }
 
   while ((*next_checkpoint_index) < all_checkpoints.size() &&
-         GetTransactionCommitTime(all_checkpoints[*next_checkpoint_index]) <= commit_time) {
+         ((GetTransactionCommitTime(all_checkpoints[*next_checkpoint_index]) < commit_time) ||
+          (all_checkpoints[*next_checkpoint_index]->id().index() == msg->id().index()))) {
+    (*wal_segment_index)--;
     (*next_checkpoint_index)++;
     update_checkpoint = true;
   }
@@ -1530,27 +1548,55 @@ uint64_t GetConsistentStreamSafeTime(
              : consistent_stream_safe_time.ToUint64();
 }
 
+void UpdateSafetimeForResponse(
+    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, const bool& update_safe_time,
+    const int64_t& safe_hybrid_time_req, HybridTime* ht_of_last_returned_message,
+    HybridTime* safe_hybrid_time_resp) {
+  *ht_of_last_returned_message = HybridTime(GetTransactionCommitTime(msg));
+
+  if (!FLAGS_cdc_enable_consistent_records || update_safe_time) {
+    *safe_hybrid_time_resp = *ht_of_last_returned_message;
+    return;
+  }
+
+  if (!safe_hybrid_time_resp->is_valid()) {
+    *safe_hybrid_time_resp = HybridTime((safe_hybrid_time_req > 0) ? safe_hybrid_time_req : 0);
+  }
+}
+
 void UpdateCheckpointIfPossible(
-    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg,
-    HybridTime* ht_of_last_returned_message, size_t* next_checkpoint_index,
+    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, const bool& update_safe_time,
+    const int64_t& safe_hybrid_time_req, HybridTime* ht_of_last_returned_message,
+    size_t* next_checkpoint_index,
     const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints,
-    CDCSDKCheckpointPB* checkpoint, OpId* last_streamed_op_id) {
-  (*ht_of_last_returned_message) = HybridTime(msg->hybrid_time());
+    CDCSDKCheckpointPB* checkpoint, OpId* last_streamed_op_id, HybridTime* safe_hybrid_time_resp,
+    int* wal_segment_index) {
+  UpdateSafetimeForResponse(
+      msg, update_safe_time, safe_hybrid_time_req, ht_of_last_returned_message,
+      safe_hybrid_time_resp);
+  (*wal_segment_index)++;
   if (CanUpdateCheckpointOpId(
-          msg, next_checkpoint_index, all_checkpoints, ht_of_last_returned_message->ToUint64())) {
+          msg, next_checkpoint_index, all_checkpoints, ht_of_last_returned_message->ToUint64(),
+          wal_segment_index)) {
     auto msg = all_checkpoints[(*next_checkpoint_index) - 1];
     SetCheckpoint(msg->id().term(), msg->id().index(), 0, "", 0, checkpoint, last_streamed_op_id);
   }
 }
 
 void UpdateCheckpointForMultiShardTxnIfPossible(
-    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg,
-    HybridTime* ht_of_last_returned_message, size_t* next_checkpoint_index,
+    const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, const bool& update_safe_time,
+    const int64_t& safe_hybrid_time_req, HybridTime* ht_of_last_returned_message,
+    size_t* next_checkpoint_index,
     const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& all_checkpoints,
-    CDCSDKCheckpointPB* checkpoint, OpId* last_streamed_op_id) {
-  (*ht_of_last_returned_message) = HybridTime(GetTransactionCommitTime(msg));
+    CDCSDKCheckpointPB* checkpoint, OpId* last_streamed_op_id, HybridTime* safe_hybrid_time_resp,
+    int* wal_segment_index) {
+  UpdateSafetimeForResponse(
+      msg, update_safe_time, safe_hybrid_time_req, ht_of_last_returned_message,
+      safe_hybrid_time_resp);
+  (*wal_segment_index)++;
   if (CanUpdateCheckpointOpId(
-          msg, next_checkpoint_index, all_checkpoints, ht_of_last_returned_message->ToUint64())) {
+          msg, next_checkpoint_index, all_checkpoints, ht_of_last_returned_message->ToUint64(),
+          wal_segment_index)) {
     auto msg = all_checkpoints[(*next_checkpoint_index) - 1];
     int64_t term = msg->id().term();
     int64_t index = msg->id().index();
@@ -1583,7 +1629,7 @@ Status GetChangesForCDCSDK(
     const TableId& colocated_table_id,
     const CoarseTimePoint deadline) {
   OpId op_id{from_op_id.term(), from_op_id.index()};
-  VLOG(1) << "GetChanges request has from_op_id: " << op_id
+  VLOG(1) << "GetChanges request has from_op_id: " << from_op_id.DebugString()
           << ", safe_hybrid_time: " << safe_hybrid_time << " for tablet_id: " << tablet_id;
   ScopedTrackedConsumption consumption;
   CDCSDKCheckpointPB checkpoint;
@@ -1591,6 +1637,7 @@ Status GetChangesForCDCSDK(
   bool report_tablet_split = false;
   OpId split_op_id = OpId::Invalid();
   bool snapshot_operation = false;
+  int wal_segment_index = GetWalSegmentIndex(from_op_id);
   bool wait_for_wal_update = false;
 
   auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet_safe());
@@ -1605,6 +1652,7 @@ Status GetChangesForCDCSDK(
   OpId historical_max_op_id = tablet_ptr->transaction_participant()->GetHistoricalMaxOpId();
   auto table_name = tablet_ptr->metadata()->table_name();
 
+  auto safe_hybrid_time_resp = HybridTime::kInvalid;
   auto ht_of_last_returned_message = HybridTime::kInvalid;
   HaveMoreMessages have_more_messages(false);
   // It is snapshot call.
@@ -1743,10 +1791,12 @@ Status GetChangesForCDCSDK(
 
     have_more_messages = HaveMoreMessages(true);
 
-    if (consistent_wal_records.size() > 0 &&
-        consistent_wal_records[0]->op_type() == consensus::OperationType::UPDATE_TRANSACTION_OP &&
-        consistent_wal_records[0]->transaction_state().has_commit_hybrid_time()) {
-      commit_timestamp = consistent_wal_records[0]->transaction_state().commit_hybrid_time();
+    if (consistent_wal_records.size() > (size_t)wal_segment_index &&
+        consistent_wal_records[wal_segment_index]->op_type() ==
+            consensus::OperationType::UPDATE_TRANSACTION_OP &&
+        consistent_wal_records[wal_segment_index]->transaction_state().has_commit_hybrid_time()) {
+      commit_timestamp =
+          consistent_wal_records[wal_segment_index]->transaction_state().commit_hybrid_time();
     } else {
       LOG(ERROR) << "Unable to read the transaction commit time for tablet_id: " << tablet_id
                  << " with stream_id: " << stream_id
@@ -1754,7 +1804,7 @@ Status GetChangesForCDCSDK(
                  << OpId::FromPB(from_op_id) << ", which can impact the safe time.";
       if (consistent_wal_records.size() > 0) {
         VLOG(1) << "Expected message with UPDATE_TRANSACTION_OP but instead received a message"
-                << "with op: " << consistent_wal_records[0]->op_type();
+                << "with op: " << consistent_wal_records[wal_segment_index]->op_type();
       }
     }
 
@@ -1768,8 +1818,10 @@ Status GetChangesForCDCSDK(
 
     if (checkpoint.write_id() == 0 && checkpoint.key().empty() && consistent_wal_records.size()) {
       UpdateCheckpointForMultiShardTxnIfPossible(
-          consistent_wal_records[0], &ht_of_last_returned_message, &next_checkpoint_index,
-          all_checkpoints, &checkpoint, last_streamed_op_id);
+          consistent_wal_records[wal_segment_index],
+          ShouldUpdateSafeTime(consistent_wal_records, wal_segment_index), safe_hybrid_time,
+          &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints, &checkpoint,
+          last_streamed_op_id, &safe_hybrid_time_resp, &wal_segment_index);
     } else {
       if (ht_of_last_returned_message == HybridTime::kInvalid) {
         ht_of_last_returned_message = HybridTime((safe_hybrid_time > 0) ? safe_hybrid_time : 0);
@@ -1832,7 +1884,20 @@ Status GetChangesForCDCSDK(
       bool pending_intents = false;
       bool saw_split_op = false;
 
-      for (const auto& msg : consistent_wal_records) {
+      for (size_t index = wal_segment_index; index < consistent_wal_records.size(); index++) {
+        const auto& msg = consistent_wal_records[index];
+
+        // In case of a connector failure we may get a wal_segment_index that is obsolete.
+        // We should not stream messages we have already streamed again in this case.
+        if (safe_hybrid_time >= 0 && GetTransactionCommitTime(msg) <= (uint64_t)safe_hybrid_time) {
+          saw_non_actionable_message = true;
+          UpdateCheckpointIfPossible(
+              msg, ShouldUpdateSafeTime(consistent_wal_records, index), safe_hybrid_time,
+              &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints, &checkpoint,
+              last_streamed_op_id, &safe_hybrid_time_resp, &wal_segment_index);
+          continue;
+        }
+
         switch (msg->op_type()) {
           case consensus::OperationType::UPDATE_TRANSACTION_OP:
             // Ignore intents.
@@ -1862,8 +1927,9 @@ Status GetChangesForCDCSDK(
                 }
               } else {
                 UpdateCheckpointForMultiShardTxnIfPossible(
-                    msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
-                    &checkpoint, last_streamed_op_id);
+                    msg, ShouldUpdateSafeTime(consistent_wal_records, index), safe_hybrid_time,
+                    &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
+                    &checkpoint, last_streamed_op_id, &safe_hybrid_time_resp, &wal_segment_index);
               }
               checkpoint_updated = true;
             }
@@ -1879,8 +1945,9 @@ Status GetChangesForCDCSDK(
                   cached_schema_details, resp, client));
 
               UpdateCheckpointIfPossible(
-                  msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
-                  &checkpoint, last_streamed_op_id);
+                  msg, ShouldUpdateSafeTime(consistent_wal_records, index), safe_hybrid_time,
+                  &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
+                  &checkpoint, last_streamed_op_id, &safe_hybrid_time_resp, &wal_segment_index);
               checkpoint_updated = true;
             }
           } break;
@@ -1933,8 +2000,9 @@ Status GetChangesForCDCSDK(
             }
 
             UpdateCheckpointIfPossible(
-                msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
-                &checkpoint, last_streamed_op_id);
+                msg, ShouldUpdateSafeTime(consistent_wal_records, index), safe_hybrid_time,
+                &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints, &checkpoint,
+                last_streamed_op_id, &safe_hybrid_time_resp, &wal_segment_index);
             checkpoint_updated = true;
           } break;
 
@@ -1948,8 +2016,9 @@ Status GetChangesForCDCSDK(
             }
 
             UpdateCheckpointIfPossible(
-                msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
-                &checkpoint, last_streamed_op_id);
+                msg, ShouldUpdateSafeTime(consistent_wal_records, index), safe_hybrid_time,
+                &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints, &checkpoint,
+                last_streamed_op_id, &safe_hybrid_time_resp, &wal_segment_index);
           } break;
 
           case yb::consensus::OperationType::SPLIT_OP: {
@@ -1966,8 +2035,9 @@ Status GetChangesForCDCSDK(
                 HasSplitFailed(tablet_peer, msg, deadline)) {
               saw_non_actionable_message = true;
               UpdateCheckpointIfPossible(
-                  msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
-                  &checkpoint, last_streamed_op_id);
+                  msg, ShouldUpdateSafeTime(consistent_wal_records, index), safe_hybrid_time,
+                  &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
+                  &checkpoint, last_streamed_op_id, &safe_hybrid_time_resp, &wal_segment_index);
               break;
             }
 
@@ -2000,8 +2070,9 @@ Status GetChangesForCDCSDK(
                              "split to the client";
 
                 UpdateCheckpointIfPossible(
-                    msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
-                    &checkpoint, last_streamed_op_id);
+                    msg, ShouldUpdateSafeTime(consistent_wal_records, index), safe_hybrid_time,
+                    &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
+                    &checkpoint, last_streamed_op_id, &safe_hybrid_time_resp, &wal_segment_index);
                 checkpoint_updated = true;
                 split_op_id = op_id;
               }
@@ -2012,8 +2083,9 @@ Status GetChangesForCDCSDK(
             // Nothing to do for other operation types.
             saw_non_actionable_message = true;
             UpdateCheckpointIfPossible(
-                msg, &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints,
-                &checkpoint, last_streamed_op_id);
+                msg, ShouldUpdateSafeTime(consistent_wal_records, index), safe_hybrid_time,
+                &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints, &checkpoint,
+                last_streamed_op_id, &safe_hybrid_time_resp, &wal_segment_index);
             VLOG_WITH_FUNC(2) << "Found message of Op type: " << msg->op_type()
                               << ", on tablet: " << tablet_id
                               << ", with OpId: " << msg->id().ShortDebugString();
@@ -2066,8 +2138,8 @@ Status GetChangesForCDCSDK(
   auto safe_time = wait_for_wal_update
                        ? HybridTime((safe_hybrid_time > 0) ? safe_hybrid_time : 0)
                        : GetCDCSDKSafeTimeForTarget(
-                             leader_safe_time.get(), ht_of_last_returned_message,
-                             have_more_messages, consistent_stream_safe_time, snapshot_operation);
+                             leader_safe_time.get(), safe_hybrid_time_resp, have_more_messages,
+                             consistent_stream_safe_time, snapshot_operation);
   resp->set_safe_hybrid_time(safe_time.ToUint64());
   VLOG(1) << "The safe_hybrid_time in response is set to " << resp->safe_hybrid_time();
 
@@ -2078,6 +2150,7 @@ Status GetChangesForCDCSDK(
 
   checkpoint_updated ? resp->mutable_cdc_sdk_checkpoint()->CopyFrom(checkpoint)
                      : resp->mutable_cdc_sdk_checkpoint()->CopyFrom(from_op_id);
+  resp->mutable_cdc_sdk_checkpoint()->set_wal_segment_index(wal_segment_index);
 
   if (last_streamed_op_id->index > 0) {
     last_streamed_op_id->ToPB(resp->mutable_checkpoint()->mutable_op_id());
