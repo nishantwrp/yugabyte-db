@@ -1461,10 +1461,9 @@ Status GetWALRecords(
   return Status::OK();
 }
 
-int GetWalSegmentIndex(const CDCSDKCheckpointPB& from_op_id) {
+int GetWalSegmentIndex(const int& wal_segment_index_req) {
   if (!FLAGS_cdc_enable_consistent_records) return 0;
-  int wal_segment_index = from_op_id.wal_segment_index();
-  return wal_segment_index >= 0 ? wal_segment_index : 0;
+  return wal_segment_index_req >= 0 ? wal_segment_index_req : 0;
 }
 
 uint64_t ShouldUpdateSafeTime(
@@ -1609,6 +1608,7 @@ Status GetChangesForCDCSDK(
     SchemaDetailsMap* cached_schema_details,
     OpId* last_streamed_op_id,
     const int64_t& safe_hybrid_time,
+    const int& wal_segment_index_req,
     int64_t* last_readable_opid_index,
     const TableId& colocated_table_id,
     const CoarseTimePoint deadline) {
@@ -1622,7 +1622,7 @@ Status GetChangesForCDCSDK(
   OpId split_op_id = OpId::Invalid();
   bool snapshot_operation = false;
   bool pending_intents = false;
-  int wal_segment_index = GetWalSegmentIndex(from_op_id);
+  int wal_segment_index = GetWalSegmentIndex(wal_segment_index_req);
   bool wait_for_wal_update = false;
 
   auto tablet_ptr = VERIFY_RESULT(tablet_peer->shared_tablet_safe());
@@ -2015,7 +2015,8 @@ Status GetChangesForCDCSDK(
             const TableId& table_id = tablet_ptr->metadata()->table_id();
             auto op_id = OpId::FromPB(msg->id());
 
-            // Handle if SPLIT_OP corresponds to the parent tablet.
+            // Handle if SPLIT_OP corresponds to the parent tablet or we know that the split_op was
+            // unsuccessful.
             if (msg->split_request().tablet_id() != tablet_id ||
                 HasSplitFailed(consistent_wal_records, index)) {
               saw_non_actionable_message = true;
@@ -2135,7 +2136,7 @@ Status GetChangesForCDCSDK(
 
   checkpoint_updated ? resp->mutable_cdc_sdk_checkpoint()->CopyFrom(checkpoint)
                      : resp->mutable_cdc_sdk_checkpoint()->CopyFrom(from_op_id);
-  resp->mutable_cdc_sdk_checkpoint()->set_wal_segment_index(wal_segment_index);
+  resp->set_wal_segment_index(wal_segment_index);
 
   if (last_streamed_op_id->index > 0) {
     last_streamed_op_id->ToPB(resp->mutable_checkpoint()->mutable_op_id());

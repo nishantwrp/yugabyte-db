@@ -985,7 +985,7 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
     change_req->mutable_from_cdc_sdk_checkpoint()->set_key(key);
     change_req->mutable_from_cdc_sdk_checkpoint()->set_write_id(write_id);
     change_req->mutable_from_cdc_sdk_checkpoint()->set_snapshot_time(snapshot_time);
-    change_req->mutable_from_cdc_sdk_checkpoint()->set_wal_segment_index(wal_segment_index);
+    change_req->set_wal_segment_index(wal_segment_index);
     if (!table_id.empty()) {
       change_req->set_table_id(table_id);
     }
@@ -1009,18 +1009,18 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
       GetChangesRequestPB* change_req, const CDCStreamId& stream_id,
       const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
       const CDCSDKCheckpointPB& cp, const int tablet_idx = 0, const TableId table_id = "",
-      int64 safe_hybrid_time = -1) {
+      int64 safe_hybrid_time = -1, int32_t wal_segment_index = 0) {
     change_req->set_stream_id(stream_id);
     change_req->set_tablet_id(tablets.Get(tablet_idx).tablet_id());
     change_req->mutable_from_cdc_sdk_checkpoint()->set_term(cp.term());
     change_req->mutable_from_cdc_sdk_checkpoint()->set_index(cp.index());
     change_req->mutable_from_cdc_sdk_checkpoint()->set_key(cp.key());
     change_req->mutable_from_cdc_sdk_checkpoint()->set_write_id(cp.write_id());
-    change_req->mutable_from_cdc_sdk_checkpoint()->set_wal_segment_index(cp.wal_segment_index());
     if (!table_id.empty()) {
       change_req->set_table_id(table_id);
     }
     change_req->set_safe_hybrid_time(safe_hybrid_time);
+    change_req->set_wal_segment_index(wal_segment_index);
   }
 
   void PrepareChangeRequest(
@@ -1032,7 +1032,6 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
     change_req->mutable_from_cdc_sdk_checkpoint()->set_index(cp.index());
     change_req->mutable_from_cdc_sdk_checkpoint()->set_key(cp.key());
     change_req->mutable_from_cdc_sdk_checkpoint()->set_write_id(cp.write_id());
-    change_req->mutable_from_cdc_sdk_checkpoint()->set_wal_segment_index(cp.wal_segment_index());
   }
 
   void PrepareChangeRequestWithExplicitCheckpoint(
@@ -1454,15 +1453,19 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
       const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
       const CDCSDKCheckpointPB* cp = nullptr,
       int tablet_idx = 0,
-      int64 safe_hybrid_time = -1) {
+      int64 safe_hybrid_time = -1,
+      int wal_segment_index = 0) {
     GetChangesRequestPB change_req;
     GetChangesResponsePB change_resp;
 
     if (cp == nullptr) {
       PrepareChangeRequest(
-          &change_req, stream_id, tablets, tablet_idx, 0, 0, "", 0, 0, "", safe_hybrid_time);
+          &change_req, stream_id, tablets, tablet_idx, 0, 0, "", 0, 0, "", safe_hybrid_time,
+          wal_segment_index);
     } else {
-      PrepareChangeRequest(&change_req, stream_id, tablets, *cp, tablet_idx, "", safe_hybrid_time);
+      PrepareChangeRequest(
+          &change_req, stream_id, tablets, *cp, tablet_idx, "", safe_hybrid_time,
+          wal_segment_index);
     }
 
     // Retry only on LeaderNotReadyToServe or NotFound errors
@@ -1530,18 +1533,20 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
       const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
       const CDCSDKCheckpointPB* cp = nullptr,
       int tablet_idx = 0,
-      int64 safe_hybrid_time = -1) {
+      int64 safe_hybrid_time = -1,
+      int wal_segment_index = 0) {
     GetAllPendingChangesResponse resp;
 
     int prev_records = 0;
     CDCSDKCheckpointPB prev_checkpoint;
     int64 prev_safetime = safe_hybrid_time;
+    int prev_index = wal_segment_index;
     const CDCSDKCheckpointPB* prev_checkpoint_ptr = cp;
 
     do {
       GetChangesResponsePB change_resp;
-      auto get_changes_result =
-          GetChangesFromCDC(stream_id, tablets, prev_checkpoint_ptr, tablet_idx, prev_safetime);
+      auto get_changes_result = GetChangesFromCDC(
+          stream_id, tablets, prev_checkpoint_ptr, tablet_idx, prev_safetime, prev_index);
 
       if (get_changes_result.ok()) {
         change_resp = *get_changes_result;
@@ -1558,6 +1563,7 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
       prev_checkpoint = change_resp.cdc_sdk_checkpoint();
       prev_checkpoint_ptr = &prev_checkpoint;
       prev_safetime = change_resp.has_safe_hybrid_time() ? change_resp.safe_hybrid_time() : -1;
+      prev_index = change_resp.wal_segment_index();
       prev_records = change_resp.cdc_sdk_proto_records_size();
     } while (prev_records != 0);
 
