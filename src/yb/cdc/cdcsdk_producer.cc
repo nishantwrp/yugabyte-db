@@ -1339,7 +1339,9 @@ void SortConsistentWALRecords(
       (*consistent_wal_records).begin(), (*consistent_wal_records).end(),
       [](const std::shared_ptr<yb::consensus::LWReplicateMsg>& lhs,
          const std::shared_ptr<yb::consensus::LWReplicateMsg>& rhs) -> bool {
-        return GetTransactionCommitTime(lhs) < GetTransactionCommitTime(rhs);
+        auto lhs_commit_time = GetTransactionCommitTime(lhs);
+        auto rhs_commit_time = GetTransactionCommitTime(rhs);
+        return lhs_commit_time == rhs_commit_time ? lhs < rhs : lhs_commit_time < rhs_commit_time;
       });
 }
 
