@@ -1520,6 +1520,13 @@ uint64_t GetConsistentStreamSafeTime(
              : consistent_stream_safe_time.ToUint64();
 }
 
+void SetSafetimeFromRequestIfInvalid(
+    const int64_t& safe_hybrid_time_req, HybridTime* safe_hybrid_time_resp) {
+  if (!safe_hybrid_time_resp->is_valid()) {
+    *safe_hybrid_time_resp = HybridTime((safe_hybrid_time_req > 0) ? safe_hybrid_time_req : 0);
+  }
+}
+
 void UpdateSafetimeForResponse(
     const std::shared_ptr<yb::consensus::LWReplicateMsg>& msg, const bool& update_safe_time,
     const int64_t& safe_hybrid_time_req, HybridTime* safe_hybrid_time_resp) {
@@ -1528,9 +1535,7 @@ void UpdateSafetimeForResponse(
     return;
   }
 
-  if (!safe_hybrid_time_resp->is_valid()) {
-    *safe_hybrid_time_resp = HybridTime((safe_hybrid_time_req > 0) ? safe_hybrid_time_req : 0);
-  }
+  SetSafetimeFromRequestIfInvalid(safe_hybrid_time_req, safe_hybrid_time_resp);
 }
 
 void UpdateCheckpointIfPossible(
@@ -1784,9 +1789,7 @@ Status GetChangesForCDCSDK(
           &safe_hybrid_time_resp, &wal_segment_index);
     } else {
       pending_intents = true;
-      if (safe_hybrid_time_resp == HybridTime::kInvalid) {
-        safe_hybrid_time_resp = HybridTime((safe_hybrid_time_req > 0) ? safe_hybrid_time_req : 0);
-      }
+      SetSafetimeFromRequestIfInvalid(safe_hybrid_time_req, &safe_hybrid_time_resp);
     }
     checkpoint_updated = true;
   } else {
@@ -1894,10 +1897,7 @@ Status GetChangesForCDCSDK(
                 pending_intents = true;
                 VLOG(1) << "There are pending intents for the transaction id " << txn_id
                         << " with apply record OpId: " << op_id;
-                if (safe_hybrid_time_resp == HybridTime::kInvalid) {
-                  safe_hybrid_time_resp =
-                      HybridTime((safe_hybrid_time_req > 0) ? safe_hybrid_time_req : 0);
-                }
+                SetSafetimeFromRequestIfInvalid(safe_hybrid_time_req, &safe_hybrid_time_resp);
               } else {
                 UpdateCheckpointForMultiShardTxnIfPossible(
                     msg, ShouldUpdateSafeTime(consistent_wal_records, index), safe_hybrid_time_req,
@@ -2024,6 +2024,7 @@ Status GetChangesForCDCSDK(
               LOG(INFO) << "Found SPLIT_OP record with index: " << op_id
                         << ", but did not find any children tablets for the tablet: " << tablet_id
                         << ". This is possible when the child tablets are not up and running yet.";
+              SetSafetimeFromRequestIfInvalid(safe_hybrid_time_req, &safe_hybrid_time_resp);
             } else {
               if (checkpoint_updated) {
                 // If we have records which are yet to be streamed which we discovered in the same
