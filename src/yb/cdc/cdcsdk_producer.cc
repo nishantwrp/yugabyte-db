@@ -1354,7 +1354,6 @@ Status GetConsistentWALRecords(
     const uint64_t& consistent_safe_time, const OpId& historical_max_op_id,
     bool* wait_for_wal_update, OpId* last_seen_op_id, int64_t** last_readable_opid_index,
     const int64_t& safe_hybrid_time, const CoarseTimePoint& deadline) {
-  bool stop_fetching_messages = false;
   do {
     consensus::ReadOpsResult read_ops;
     read_ops = VERIFY_RESULT(tablet_peer->consensus()->ReadReplicatedMessagesForCDC(
@@ -1379,14 +1378,6 @@ Status GetConsistentWALRecords(
         continue;
       }
 
-      if (GetTransactionCommitTime(msg) > consistent_safe_time) {
-        VLOG_WITH_FUNC(1) << "Received a message with commit_time > consistent_safe_time."
-                             " Ending the segment here. consistent_safe_time: "
-                          << consistent_safe_time << " msg: " << msg->ShortDebugString();
-        stop_fetching_messages = true;
-        break;
-      }
-
       last_seen_op_id->term = msg->id().term();
       last_seen_op_id->index = msg->id().index();
       all_checkpoints->push_back(msg);
@@ -1397,12 +1388,10 @@ Status GetConsistentWALRecords(
       *msgs_holder = consensus::ReplicateMsgsHolder(
           nullptr, std::move(read_ops.messages), std::move((*consumption)));
     }
-  } while ((!stop_fetching_messages) &&
-           ((*last_readable_opid_index) && last_seen_op_id->index < **last_readable_opid_index));
+  } while (((*last_readable_opid_index) && last_seen_op_id->index < **last_readable_opid_index));
 
   // Handle the case where WAL doesn't have the apply record for all the committed transactions.
-  if (!stop_fetching_messages && historical_max_op_id.valid() &&
-      historical_max_op_id > *last_seen_op_id) {
+  if (historical_max_op_id.valid() && historical_max_op_id > *last_seen_op_id) {
     (*wait_for_wal_update) = true;
   }
 
@@ -1874,13 +1863,26 @@ Status GetChangesForCDCSDK(
 
         // In case of a connector failure we may get a wal_segment_index that is obsolete.
         // We should not stream messages we have already streamed again in this case.
-        if (safe_hybrid_time >= 0 && GetTransactionCommitTime(msg) <= (uint64_t)safe_hybrid_time) {
+        if (FLAGS_cdc_enable_consistent_records && safe_hybrid_time >= 0 &&
+            GetTransactionCommitTime(msg) <= (uint64_t)safe_hybrid_time) {
           saw_non_actionable_message = true;
           UpdateCheckpointIfPossible(
               msg, ShouldUpdateSafeTime(consistent_wal_records, index), safe_hybrid_time,
               &ht_of_last_returned_message, &next_checkpoint_index, all_checkpoints, &checkpoint,
               last_streamed_op_id, &safe_hybrid_time_resp, &wal_segment_index);
           continue;
+        }
+
+        // We should break if we have started seeing records with commit_time more than the
+        // consistent_stream_safe_time.
+        if (FLAGS_cdc_enable_consistent_records &&
+            GetTransactionCommitTime(msg) >= consistent_stream_safe_time) {
+          VLOG_WITH_FUNC(2)
+              << "Received a message in wal_segment with commit_time >= consistent_safe_time."
+                 " Will not process further messages in this GetChanges call. "
+                 "consistent_safe_time: "
+              << consistent_stream_safe_time << ", wal_msg: " << msg->ShortDebugString();
+          break;
         }
 
         switch (msg->op_type()) {
