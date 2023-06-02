@@ -1865,7 +1865,7 @@ Status GetChangesForCDCSDK(
         // We should break if we have started seeing records with commit_time more than the
         // consistent_stream_safe_time.
         if (FLAGS_cdc_enable_consistent_records &&
-            GetTransactionCommitTime(msg) >= consistent_stream_safe_time) {
+            GetTransactionCommitTime(msg) > consistent_stream_safe_time) {
           VLOG_WITH_FUNC(2)
               << "Received a message in wal_segment with commit_time >= consistent_safe_time."
                  " Will not process further messages in this GetChanges call. "
