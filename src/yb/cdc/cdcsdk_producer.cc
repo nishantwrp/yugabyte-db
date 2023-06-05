@@ -58,6 +58,11 @@ DEFINE_NON_RUNTIME_bool(
     cdc_enable_consistent_records, true,
     "If 'true' we will ensure that the records are order by the commit_time.");
 
+DEFINE_RUNTIME_uint64(
+    cdc_stream_records_threshold_size_bytes, 4_MB,
+    "The threshold for the size of the response of a GetChanges call. The actual size may be a "
+    "little higher than this value.");
+
 DEFINE_test_flag(
     bool, cdc_snapshot_failure, false,
     "For testing only, When it is set to true, the CDC snapshot operation will fail.");
@@ -1449,11 +1454,13 @@ Status GetWALRecords(
   return Status::OK();
 }
 
+// Basic sanity checks on the wal_segment_index recieved from the request.
 int GetWalSegmentIndex(const int& wal_segment_index_req) {
   if (!FLAGS_cdc_enable_consistent_records) return 0;
   return wal_segment_index_req >= 0 ? wal_segment_index_req : 0;
 }
 
+// Returns 'true' if we should update the response safe time to the record's commit time.
 uint64_t ShouldUpdateSafeTime(
     const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& wal_records,
     const size_t& current_index) {
@@ -1465,6 +1472,8 @@ uint64_t ShouldUpdateSafeTime(
   return true;
 }
 
+// Returns 'true' if we know for sure that the split corresponding to the 'split_op_index'
+// had failed.
 bool HasSplitFailed(
     const std::vector<std::shared_ptr<yb::consensus::LWReplicateMsg>>& wal_records,
     const size_t& split_op_index) {
@@ -1516,6 +1525,9 @@ uint64_t GetConsistentStreamSafeTime(
                                     ? leader_safe_time
                                     : consistent_stream_safe_time;
   return safe_hybrid_time_req > 0
+             // It is possible for us to receive a transaction with begin time lower than
+             // a previously fetched leader_safe_time. So, we need a max of safe time from request
+             // and consistent_stream_safe_time here.
              ? std::max(consistent_stream_safe_time.ToUint64(), (uint64_t)safe_hybrid_time_req)
              : consistent_stream_safe_time.ToUint64();
 }
@@ -1745,6 +1757,8 @@ Status GetChangesForCDCSDK(
           &all_checkpoints, consistent_stream_safe_time, historical_max_op_id, &wait_for_wal_update,
           &last_seen_op_id, &last_readable_opid_index, safe_hybrid_time_req, deadline));
     else
+      // 'skip_intents' is true here because we want the first transaction to be the partially
+      // streamed transaction.
       RETURN_NOT_OK(GetWALRecords(
           tablet_peer, mem_tracker, msgs_holder, &consumption, &consistent_wal_records,
           &all_checkpoints, consistent_stream_safe_time, &last_seen_op_id,
@@ -1848,6 +1862,10 @@ Status GetChangesForCDCSDK(
       bool saw_split_op = false;
 
       for (size_t index = wal_segment_index; index < consistent_wal_records.size(); index++) {
+        if (resp->ByteSizeLong() >= FLAGS_cdc_stream_records_threshold_size_bytes) {
+          break;
+        }
+
         const auto& msg = consistent_wal_records[index];
 
         // In case of a connector failure we may get a wal_segment_index that is obsolete.
@@ -1995,11 +2013,6 @@ Status GetChangesForCDCSDK(
           } break;
 
           case yb::consensus::OperationType::SPLIT_OP: {
-            // It is possible that we found records corresponding to SPLIT_OP even when it failed.
-            // We first verify if a split has indeed occured succesfully on the tablet by checking:
-            // 1. There are two children tablets for the tablet
-            // 2. The split op is the last operation on the tablet
-            // If either of the conditions are false, we will know the splitOp is not succesfull.
             const TableId& table_id = tablet_ptr->metadata()->table_id();
             auto op_id = OpId::FromPB(msg->id());
 
@@ -2018,6 +2031,8 @@ Status GetChangesForCDCSDK(
             // Set 'saw_split_op' to true only if the split op is for the current tablet.
             saw_split_op = true;
 
+            // We first verify if a split has indeed occured succesfully by checking if there are
+            // two children tablets for the tablet.
             if (!(VerifyTabletSplitOnParentTablet(table_id, tablet_id, client))) {
               // We could verify the tablet split succeeded. This is possible when the child tablets
               // of a split are not running yet.
@@ -2031,6 +2046,9 @@ Status GetChangesForCDCSDK(
                 // 'GetChangesForCDCSDK' call, we will not update the checkpoint to the SplitOp
                 // record's OpId and return the records seen till now. Next time the client will
                 // call 'GetChangesForCDCSDK' with the OpId just before the SplitOp's record.
+                //
+                // NOTE: It is fine to not update the checkpoint in this case because this should
+                // be the last actionable record in the WAL.
                 LOG(INFO) << "Found SPLIT_OP record with OpId: " << op_id
                           << ", for parent tablet: " << tablet_id
                           << ", will stream all seen records until now.";
@@ -2110,6 +2128,8 @@ Status GetChangesForCDCSDK(
     consumption.Add(resp->SpaceUsedLong());
   }
 
+  // If we need to wait for WAL to get up to date with all committed transactions, we will send the
+  // request safe in the response as well.
   auto safe_time = wait_for_wal_update
                        ? HybridTime((safe_hybrid_time_req > 0) ? safe_hybrid_time_req : 0)
                        : GetCDCSDKSafeTimeForTarget(
@@ -2118,6 +2138,7 @@ Status GetChangesForCDCSDK(
   resp->set_safe_hybrid_time(safe_time.ToUint64());
   VLOG(1) << "The safe_hybrid_time in response is set to " << resp->safe_hybrid_time();
 
+  // It is possible in case of a partially streamed transaction.
   if (checkpoint_updated && !(checkpoint.has_term() && checkpoint.has_index())) {
     checkpoint.set_term(from_op_id.term());
     checkpoint.set_index(from_op_id.index());
