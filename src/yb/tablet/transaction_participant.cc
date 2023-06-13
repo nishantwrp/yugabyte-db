@@ -490,7 +490,7 @@ class TransactionParticipant::Impl
           min_begin_time > transaction->start_ht()) {
         min_begin_time = transaction->start_ht();
       }
-   }
+    }
 
     return min_begin_time;
   }
