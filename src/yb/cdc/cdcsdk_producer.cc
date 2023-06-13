@@ -360,8 +360,9 @@ Result<size_t> PopulatePackedRows(
 
 HybridTime GetCDCSDKSafeTimeForTarget(
     const HybridTime leader_safe_time, HybridTime safe_hybrid_time_resp,
-    HaveMoreMessages have_more_messages, const uint64_t& consistent_stream_safe_time) {
-  if (FLAGS_cdc_enable_consistent_records) {
+    HaveMoreMessages have_more_messages, const uint64_t& consistent_stream_safe_time,
+    const bool& is_snapshot_op) {
+  if (FLAGS_cdc_enable_consistent_records || is_snapshot_op) {
     if (safe_hybrid_time_resp.is_valid()) {
       return safe_hybrid_time_resp;
     }
@@ -2316,7 +2317,7 @@ Status GetChangesForCDCSDK(
                        ? HybridTime((safe_hybrid_time_req > 0) ? safe_hybrid_time_req : 0)
                        : GetCDCSDKSafeTimeForTarget(
                              leader_safe_time.get(), safe_hybrid_time_resp, have_more_messages,
-                             consistent_stream_safe_time);
+                             consistent_stream_safe_time, snapshot_operation);
   resp->set_safe_hybrid_time(safe_time.ToUint64());
 
   // It is possible in case of a partially streamed transaction.
