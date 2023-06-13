@@ -481,19 +481,18 @@ class TransactionParticipant::Impl
 
   HybridTime GetMinStartTimeAmongAllRunningTransactions() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (transactions_.get<StartTimeTag>().size() == 0) {
-      return HybridTime::kInvalid;
-    }
+    HybridTime min_begin_time = HybridTime::kInvalid;
 
-    for (const auto& transaction : transactions_.get<StartTimeTag>()) {
+    for (const auto& transaction : transactions_) {
       auto const& transaction_status = transaction->last_known_status();
-      if (transaction_status != TransactionStatus::COMMITTED &&
-          transaction_status != TransactionStatus::ABORTED) {
-        return transaction->start_ht();
+      if (transaction->last_known_status() != TransactionStatus::COMMITTED &&
+          transaction_status != TransactionStatus::ABORTED &&
+          min_begin_time > transaction->start_ht()) {
+        min_begin_time = transaction->start_ht();
       }
-    }
+   }
 
-    return HybridTime::kInvalid;
+    return min_begin_time;
   }
 
   OpId GetHistoricalMaxOpId() {
