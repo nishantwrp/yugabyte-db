@@ -136,6 +136,12 @@ std::string TransactionApplyData::ToString() const {
       apply_state, is_external);
 }
 
+void UpdateHistoricalMaxOpId(std::atomic<OpId>* historical_max_op_id, OpId const& op_id) {
+  OpId prev_value = (*historical_max_op_id);
+  while (prev_value < op_id && !historical_max_op_id->compare_exchange_weak(prev_value, op_id)) {
+  }
+}
+
 class TransactionParticipant::Impl
     : public RunningTransactionContext, public TransactionLoaderContext {
  public:
@@ -259,6 +265,9 @@ class TransactionParticipant::Impl
       return STATUS(InvalidArgument, Format("For external transaction $0, status tablet is empty",
                                              metadata.transaction_id));
     }
+
+    VLOG_WITH_PREFIX(3) << "Adding a new transaction txn_id: " << metadata.transaction_id
+                        << " with begin_time: " << metadata.start_time.ToUint64();
     transactions_.insert(std::make_shared<RunningTransaction>(
         metadata, TransactionalBatchData(), OneWayBitmap(), metadata.start_time, this));
     mem_tracker_->Consume(kRunningTransactionSize);
@@ -468,6 +477,28 @@ class TransactionParticipant::Impl
       min_checkpoint = OpId::Max();
     }
     return min_checkpoint;
+  }
+
+  HybridTime GetMinStartTimeAmongAllRunningTransactions() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (transactions_.get<StartTimeTag>().size() == 0) {
+      return HybridTime::kInvalid;
+    }
+
+    for (const auto& transaction : transactions_.get<StartTimeTag>()) {
+      auto const& transaction_status = transaction->last_known_status();
+      if (transaction_status != TransactionStatus::COMMITTED &&
+          transaction_status != TransactionStatus::ABORTED) {
+        return transaction->start_ht();
+      }
+    }
+
+    return HybridTime::kInvalid;
+  }
+
+  OpId GetHistoricalMaxOpId() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return historical_max_op_id.load();
   }
 
   OpId GetRetainOpId() {
@@ -717,6 +748,9 @@ class TransactionParticipant::Impl
             << "Transaction was previously applied with another commit ht: " << existing_commit_ht
             << ", new commit ht: " << data.commit_ht;
       } else {
+        UpdateHistoricalMaxOpId(&historical_max_op_id, data.op_id);
+        VLOG_WITH_PREFIX(3) << "Committed a transaction with txn_id: " << data.transaction_id
+                            << " with commit_time: " << data.commit_ht.ToUint64();
         CHECK(transactions_.modify(lock_and_iterator.iterator, [&data](auto& txn) {
           txn->SetLocalCommitData(data.commit_ht, data.aborted);
         }));
@@ -1863,6 +1897,7 @@ class TransactionParticipant::Impl
   rpc::Poller wait_queue_poller_;
 
   OpId cdc_sdk_min_checkpoint_op_id_ = OpId::Invalid();
+  std::atomic<OpId> historical_max_op_id = OpId::Invalid();
   CoarseTimePoint cdc_sdk_min_checkpoint_op_id_expiration_ = CoarseTimePoint::min();
 
   std::condition_variable requests_completed_cond_;
@@ -2085,6 +2120,12 @@ CoarseTimePoint TransactionParticipant::GetCheckpointExpirationTime() const {
 OpId TransactionParticipant::GetLatestCheckPoint() const {
   return impl_->GetLatestCheckPointUnlocked();
 }
+
+HybridTime TransactionParticipant::GetMinStartTimeAmongAllRunningTransactions() const {
+  return impl_->GetMinStartTimeAmongAllRunningTransactions();
+}
+
+OpId TransactionParticipant::GetHistoricalMaxOpId() const { return impl_->GetHistoricalMaxOpId(); }
 
 }  // namespace tablet
 }  // namespace yb

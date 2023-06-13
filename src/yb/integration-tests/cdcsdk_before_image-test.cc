@@ -93,7 +93,6 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestSchemaChangeBeforeImage)) {
       {}, {}, {1, 2, INT_MAX}, {}, {1, 3, INT_MAX}, {}, {1, 4, INT_MAX}, {4, 5, 6}, {4, 99, 6}};
 
   GetChangesResponsePB change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
-
   // If the packed row is enabled and there are multiple tables altered, if CDC fail to get before
   // image row with the current running schema version, then it will ignore the before image tuples.
   uint32_t seen_dml_records = 0;
