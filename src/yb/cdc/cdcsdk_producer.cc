@@ -1927,17 +1927,21 @@ Status GetChangesForCDCSDK(
         wal_records[wal_segment_index]->op_type() ==
             consensus::OperationType::UPDATE_TRANSACTION_OP &&
         wal_records[wal_segment_index]->transaction_state().has_commit_hybrid_time()) {
-      auto txn_id = VERIFY_RESULT(FullyDecodeTransactionId(
-          wal_records[wal_segment_index]->transaction_state().transaction_id()));
+      const auto& msg = wal_records[wal_segment_index];
+      auto txn_id =
+          VERIFY_RESULT(FullyDecodeTransactionId(msg->transaction_state().transaction_id()));
       VLOG(3) << "Will stream remaining records for a partially streamed transaction. op_id: "
-              << wal_records[wal_segment_index]->id().ShortDebugString()
-              << ", tablet_id: " << tablet_id << ", transaction_id: " << txn_id;
-      commit_timestamp = wal_records[wal_segment_index]->transaction_state().commit_hybrid_time();
+              << msg->id().ShortDebugString() << ", tablet_id: " << tablet_id
+              << ", transaction_id: " << txn_id;
+      commit_timestamp = msg->transaction_state().commit_hybrid_time();
+
+      op_id.term = msg->id().term();
+      op_id.index = msg->id().index();
     } else {
-      LOG(ERROR) << "Unable to read the transaction commit time for tablet_id: " << tablet_id
-                 << " with stream_id: " << stream_id
-                 << " because there is no RAFT log message read from WAL with from_op_id: "
-                 << OpId::FromPB(from_op_id) << ", which can impact the safe time.";
+      LOG(DFATAL) << "Unable to read the transaction commit time for tablet_id: " << tablet_id
+                  << " with stream_id: " << stream_id
+                  << " because there is no RAFT log message read from WAL with from_op_id: "
+                  << OpId::FromPB(from_op_id) << ", which can impact the safe time.";
       if (wal_records.size() > 0) {
         VLOG(1) << "Expected message with UPDATE_TRANSACTION_OP but instead received a message"
                 << "with op: " << wal_records[wal_segment_index]->op_type();
